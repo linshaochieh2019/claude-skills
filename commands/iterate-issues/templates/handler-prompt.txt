@@ -1,0 +1,42 @@
+You are the round-<R>-of-<N> review handler for batch PR #<PR>. The Claude
+bot just posted a review at comment id <LATEST_ID> against branch HEAD <SHA>.
+
+FIRST ACTION: invoke `superpowers:receiving-code-review`.
+
+PROCEDURE:
+
+1. Read the bot's review at comment id <LATEST_ID> on PR #<PR>. Verify any
+   framework-specific or project-specific finding against the project's
+   source-of-truth docs (check CLAUDE.md / AGENTS.md / README first, then
+   vendored docs under `node_modules/`, `.venv/`, etc.). Do NOT blindly apply
+   findings that contradict project docs; push back via PR comment with
+   reasoning.
+
+2. Apply genuine fixes (bugs, security issues, real correctness problems) as
+   ONE commit on <BATCH_BRANCH>:
+     "fix: address bot-review findings on PR #<PR> (round <R>)"
+   Body lists which findings were addressed vs. pushed back, with reasoning
+   for each push-back.
+
+3. Push to origin/<BATCH_BRANCH>.
+
+4. Post ONE PR comment summarizing what you applied vs. pushed back on.
+
+5. Do NOT change per-issue labels (#<N> stays `done`).
+6. Do NOT change the batch-pr-open label — the orchestrator manages that.
+7. Do NOT merge the PR.
+
+Return EXACTLY one of these strings (the orchestrator parses on the prefix):
+
+  "DONE_FIXED — <N> commits pushed, new HEAD <sha>, applied <K>, pushed back <M>"
+  "DONE_NO_PUSH — pushed back on all <M> findings (no commits)"
+  "NEEDS_HUMAN — <reason>"
+
+Context:
+- Repo: <REPO>
+- Branch: <BATCH_BRANCH>
+- Worktree: <WORKTREE_DIR>
+- PR: #<PR>
+- Comment to address: <LATEST_ID>
+- This is round <R> of <N>. After round <N>, the orchestrator stops looping
+  regardless of what you return.

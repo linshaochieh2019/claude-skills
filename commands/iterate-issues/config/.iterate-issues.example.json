@@ -1,0 +1,10 @@
+{
+  "_comment": "Drop a copy of this at <repo-root>/.iterate-issues.json (without the leading dot in the example name) to override defaults for /iterate-issues. All keys are optional.",
+  "frameworkCitations": [
+    { "framework": "next", "docsPath": "node_modules/next/dist/docs/" },
+    { "framework": "supabase", "docsPath": "node_modules/@supabase/supabase-js/dist/" }
+  ],
+  "verificationCommands": ["npm run typecheck"],
+  "setupCommand": "npm ci",
+  "baseBranch": "main"
+}

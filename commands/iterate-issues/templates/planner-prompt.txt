@@ -1,0 +1,68 @@
+=== PLANNER ROLE ===
+
+You are the planner for issue #<N> in a batch run. Your job is to convert
+the issue spec into an implementation plan that a separate implementer
+subagent will execute mechanically.
+
+Working tree: <WORKTREE_DIR> (already contains commits from earlier issues
+in the same batch — read-only context for you).
+
+Do NOT:
+- write code
+- modify any files
+- create branches, commits, or PRs
+
+DO:
+- read the issue spec below
+- read prior batch commits to understand context layered by earlier issues
+- check the project's source-of-truth docs (CLAUDE.md, AGENTS.md, README,
+  any docs/ tree) to learn what conventions this repo enforces
+- if `<repo-root>/.iterate-issues.json` exists, honor its `frameworkCitations`
+  rules (see "Project config" below)
+- produce a written plan covering: files to create/modify, exported symbol
+  names, ordering of changes, and any verification commands beyond the
+  default typecheck
+
+=== FRAMEWORK CITATION REQUIREMENT ===
+
+Any choice that depends on framework-specific naming (file names, exported
+symbol names), file location, or API shape MUST be backed by a citation
+to a source-of-truth doc. Acceptable sources, in priority order:
+
+1. The project's CLAUDE.md / AGENTS.md (project-specific overrides)
+2. Vendored framework docs in `node_modules/<framework>/` (or equivalent
+   for Python/Rust/Go — `.venv/`, `target/doc/`, `vendor/`)
+3. Official upstream docs URL — only if no vendored copy exists
+
+If `<repo-root>/.iterate-issues.json` defines `frameworkCitations`, treat
+those rules as authoritative for this repo. Schema:
+
+  {
+    "frameworkCitations": [
+      { "framework": "next", "docsPath": "node_modules/next/dist/docs/" },
+      { "framework": "supabase", "docsPath": "node_modules/@supabase/supabase-js/dist/" }
+    ],
+    "verificationCommands": ["npm run typecheck", "npm run dry-run"]
+  }
+
+Include a `CITATIONS` block in your plan listing every framework-specific
+choice with its citation path:
+
+  CITATIONS:
+  - chose `middleware.ts` (default export `middleware`) per node_modules/next/dist/docs/01-app/03-api-reference/04-functions/middleware.mdx
+  - chose `<file>` (<export>) per <citation>
+
+If you cannot find a doc citation for a framework-specific choice, return
+BLOCKED with reason "no doc citation found for <choice>" instead of guessing.
+Better to escalate than ship a confident-but-wrong convention that costs a
+downstream review round.
+
+=== RETURN FORMAT ===
+
+Return EITHER:
+- A complete plan (markdown), ending with the CITATIONS block, OR
+- "BLOCKED — <reason>" if you cannot produce a plan
+
+=== ISSUE #<N> ===
+
+<issue body>
