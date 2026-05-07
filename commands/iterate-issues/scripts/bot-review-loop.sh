@@ -5,7 +5,7 @@
 # Usage:
 #   bot-review-loop.sh <PR_NUM> <REPO> <WORKTREE_DIR> <BATCH_BRANCH>
 #
-# Polls the "Claude Code Review" check on the given PR up to N_ROUNDS times,
+# Polls the "Code Review" check on the given PR up to N_ROUNDS times,
 # dispatching a review handler between rounds (the orchestrator passes the
 # handler's prompt and result back through env vars / stdout).
 #
@@ -71,19 +71,20 @@ fi
 echo "=== Round $ROUND of $N_ROUNDS ==="
 CURRENT_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD)
 
-# Wait for the Claude Code Review check to resolve for the current HEAD.
+# Wait for the "Code Review" check to resolve for the current HEAD.
+# (Generic check name per the iterate-issues code-review workflow contract.)
 # Run this script via the Bash tool with run_in_background=true so the harness
 # fires a single completion notification when the until-loop exits — no LLM
 # tokens burned during the wait.
 i=0
 until status=$(gh pr checks "$PR_NUM" --repo "$REPO" --json name,bucket \
-      --jq '.[] | select(.name == "Claude Code Review") | .bucket'); \
+      --jq '.[] | select(.name == "Code Review") | .bucket'); \
       [ "$status" != "pending" ] || [ "$i" -ge 60 ]; do
   sleep 30
   i=$((i+1))
 done
 final_status=$(gh pr checks "$PR_NUM" --repo "$REPO" --json name,bucket \
-  --jq '.[] | select(.name == "Claude Code Review") | .bucket')
+  --jq '.[] | select(.name == "Code Review") | .bucket')
 
 # Timeout path
 if [ "$final_status" = "pending" ]; then
@@ -92,11 +93,14 @@ if [ "$final_status" = "pending" ]; then
   exit 30
 fi
 
-# Fetch the latest claude[bot] comment whose id > LAST_HANDLED_COMMENT_ID
-# AND whose body isn't the "PR Review in Progress" placeholder.
-LATEST_COMMENT=$(gh api "repos/$REPO/issues/$PR_NUM/comments" \
-  --jq '[.[] | select(.user.login == "claude[bot]") | select(.body | test("PR Review in Progress") | not)] | last')
-LATEST_ID=$(echo "$LATEST_COMMENT" | jq '.id // 0')
+# Fetch the latest code-review comment whose id > LAST_HANDLED_COMMENT_ID.
+# We filter by the marker `<!-- ai-code-review -->` (per the workflow contract)
+# rather than by user.login, so this works regardless of which provider is
+# active and which bot identity ends up posting (claude[bot],
+# github-actions[bot], etc.). The marker is the contract — bots come and go.
+# (gh's bundled --jq avoids a hard dep on standalone jq.)
+LATEST_ID=$(gh api "repos/$REPO/issues/$PR_NUM/comments" \
+  --jq '[.[] | select(.body | contains("<!-- ai-code-review -->"))] | last | .id // 0')
 
 if [ "$LATEST_ID" -le "$LAST_HANDLED_COMMENT_ID" ]; then
   # Bot didn't post a new substantive review. Treat as terminal-clean.

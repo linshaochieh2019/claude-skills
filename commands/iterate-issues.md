@@ -86,6 +86,19 @@ The batch PR carries `batch-pr-open` while awaiting bot review, and closes the i
 
 The planner and implementer are **different subagents** with different scopes. Issue bodies from `/to-issues` are specs (what + why), not implementation plans (how + where + in what order). The planner converts spec → plan and owns framework citations; the implementer executes the plan mechanically.
 
+## Code-review workflow contract
+
+`/iterate-issues` is provider-agnostic. It does not care whether code review is run by Claude, Codex, or anything else — only that the active workflow honors this contract:
+
+| Surface | Required value | Why |
+|---|---|---|
+| GitHub check name (the job's `name:` field) | **`Code Review`** | The orchestrator polls `gh pr checks --jq '.[] \| select(.name == "Code Review")'`. Generic name → no rename when swapping providers. |
+| Summary PR comment body | Begins with **`<!-- ai-code-review -->`** | The orchestrator filters comments by this marker, not by `user.login`. Survives identity changes (`claude[bot]` ↔ `github-actions[bot]`). |
+| Posting cadence | One substantive comment per push | The orchestrator dedupes via comment id (`LATEST_ID > LAST_HANDLED_COMMENT_ID`); a new push that produces a new comment with the marker is treated as a new round. |
+| Placeholder comments | If the workflow posts a "review in progress" placeholder, it must NOT include the marker | Otherwise the orchestrator will treat the placeholder as the substantive review. |
+
+Per-project, the active code-review workflow lives in `.github/workflows/` and must meet the contract above. To swap providers (e.g., Claude ↔ Codex), replace or toggle the workflow file's trigger and adjust GitHub repo secrets accordingly. No changes to this command should be needed.
+
 ## Budgets
 
 | Phase | Wall-clock | On exceed |
@@ -239,7 +252,7 @@ If no issues completed (everything went `needs-human`), skip the PR and post the
 
 The bot auto-triggers a fresh review on every push to the PR branch. The loop runs up to **N=2 rounds** with sha-based deduplication, catching the realistic case ("bot found something → handler fixed it → bot now happy") without inviting handler-vs-bot infinite loops.
 
-**Per-round budget:** 30 min wait for the `Claude Code Review` check to leave `pending`. **Total cap:** 2 rounds.
+**Per-round budget:** 30 min wait for the `Code Review` check to leave `pending`. **Total cap:** 2 rounds.
 
 ### 6.1 Architecture: deterministic state-machine in bash, LLM dispatch in orchestrator
 
