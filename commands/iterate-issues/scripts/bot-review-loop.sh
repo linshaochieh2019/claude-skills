@@ -76,10 +76,15 @@ CURRENT_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD)
 # Run this script via the Bash tool with run_in_background=true so the harness
 # fires a single completion notification when the until-loop exits — no LLM
 # tokens burned during the wait.
+#
+# Empty `status` means the check isn't surfaced yet — keep waiting. This matters
+# for `needs:`-gated two-job workflows (e.g. OpenAI Codex's Generate review →
+# Code Review pattern), where the "Code Review" check doesn't appear in
+# `gh pr checks` output until its upstream dependency completes.
 i=0
 until status=$(gh pr checks "$PR_NUM" --repo "$REPO" --json name,bucket \
       --jq '.[] | select(.name == "Code Review") | .bucket'); \
-      [ "$status" != "pending" ] || [ "$i" -ge 60 ]; do
+      { [ -n "$status" ] && [ "$status" != "pending" ]; } || [ "$i" -ge 60 ]; do
   sleep 30
   i=$((i+1))
 done
