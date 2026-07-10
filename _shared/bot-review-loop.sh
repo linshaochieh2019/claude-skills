@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# Bot review polling loop for /iterate-issues batch PRs.
+# Bot review polling loop. Used by /iterate-issues and /await-review.
 #
 # Usage:
-#   bot-review-loop.sh <PR_NUM> <REPO> <WORKTREE_DIR> <BATCH_BRANCH>
+#   bot-review-loop.sh <PR_NUM> <REPO> <WORKTREE_DIR> <BRANCH>
 #
 # Polls the "Code Review" check on the given PR up to N_ROUNDS times,
 # dispatching a review handler between rounds (the orchestrator passes the
@@ -17,11 +17,16 @@
 # It does NOT dispatch the LLM handler itself. Instead, when a new bot review
 # is detected, the script prints "DISPATCH_HANDLER round=<R> head=<sha> comment_id=<id>"
 # and exits with code 10. The orchestrator reads that line, dispatches the
-# Haiku handler subagent (templates/handler-prompt.md), and re-invokes this
+# Haiku handler subagent (../_shared/handler-prompt.txt), and re-invokes this
 # script with the handler's result via the HANDLER_RESULT env var.
 #
 # This keeps subagent dispatch in the LLM orchestrator (which has the Task
 # tool) and pure state-watching here in bash (cheap, deterministic).
+#
+# Optional env vars:
+#   INPROGRESS_LABEL  — if set, this label is removed from the PR on every
+#                       terminal exit. /iterate-issues passes "batch-pr-open";
+#                       /await-review leaves it unset.
 #
 # Exit codes:
 #   0   loop terminated cleanly (PR ready for human review)
@@ -34,12 +39,18 @@ set -euo pipefail
 PR_NUM="${1:?PR_NUM required}"
 REPO="${2:?REPO required}"
 WORKTREE_DIR="${3:?WORKTREE_DIR required}"
-BATCH_BRANCH="${4:?BATCH_BRANCH required}"
+BRANCH="${4:?BRANCH required}"
 
-N_ROUNDS="${N_ROUNDS:-2}"
+N_ROUNDS="${N_ROUNDS:-3}"
 ROUND="${ROUND:-1}"
 LAST_HANDLED_COMMENT_ID="${LAST_HANDLED_COMMENT_ID:-0}"
 HANDLER_RESULT="${HANDLER_RESULT:-}"
+INPROGRESS_LABEL="${INPROGRESS_LABEL:-}"
+
+remove_inprogress_label() {
+  [ -n "$INPROGRESS_LABEL" ] || return 0
+  gh pr edit "$PR_NUM" --remove-label "$INPROGRESS_LABEL" --repo "$REPO" 2>/dev/null || true
+}
 
 # If the orchestrator passes back a HANDLER_RESULT from a prior dispatch,
 # branch on it before polling for the next round.
@@ -49,22 +60,20 @@ if [ -n "$HANDLER_RESULT" ]; then
       ROUND=$((ROUND + 1))
       ;;
     DONE_NO_PUSH*)
-      gh pr edit "$PR_NUM" --remove-label batch-pr-open --repo "$REPO"
+      remove_inprogress_label
       exit 0
       ;;
     NEEDS_HUMAN*)
-      gh pr edit "$PR_NUM" --remove-label batch-pr-open --add-label needs-human --repo "$REPO"
+      remove_inprogress_label
+      gh pr edit "$PR_NUM" --add-label needs-human --repo "$REPO"
       exit 20
       ;;
   esac
 fi
 
 if [ "$ROUND" -gt "$N_ROUNDS" ]; then
-  # Hit the cap. Clear batch-pr-open if still set.
-  final_labels=$(gh pr view "$PR_NUM" --repo "$REPO" --json labels --jq '.labels | map(.name)')
-  if echo "$final_labels" | grep -q '"batch-pr-open"'; then
-    gh pr edit "$PR_NUM" --remove-label batch-pr-open --repo "$REPO"
-  fi
+  # Hit the cap.
+  remove_inprogress_label
   exit 0
 fi
 
@@ -72,7 +81,7 @@ echo "=== Round $ROUND of $N_ROUNDS ==="
 CURRENT_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD)
 
 # Wait for the "Code Review" check to resolve for the current HEAD.
-# (Generic check name per the iterate-issues code-review workflow contract.)
+# (Generic check name per the code-review workflow contract.)
 # Run this script via the Bash tool with run_in_background=true so the harness
 # fires a single completion notification when the until-loop exits — no LLM
 # tokens burned during the wait.
@@ -93,7 +102,8 @@ final_status=$(gh pr checks "$PR_NUM" --repo "$REPO" --json name,bucket \
 
 # Timeout path
 if [ "$final_status" = "pending" ]; then
-  gh pr edit "$PR_NUM" --add-label bot-review-timeout --remove-label batch-pr-open --repo "$REPO"
+  remove_inprogress_label
+  gh pr edit "$PR_NUM" --add-label bot-review-timeout --repo "$REPO"
   echo "TIMEOUT round=$ROUND head=$CURRENT_HEAD"
   exit 30
 fi
@@ -110,7 +120,7 @@ LATEST_ID=$(gh api "repos/$REPO/issues/$PR_NUM/comments" \
 if [ "$LATEST_ID" -le "$LAST_HANDLED_COMMENT_ID" ]; then
   # Bot didn't post a new substantive review. Treat as terminal-clean.
   echo "NO_NEW_REVIEW round=$ROUND head=$CURRENT_HEAD"
-  gh pr edit "$PR_NUM" --remove-label batch-pr-open --repo "$REPO"
+  remove_inprogress_label
   exit 0
 fi
 

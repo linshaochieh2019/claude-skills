@@ -6,5 +6,7 @@
   ],
   "verificationCommands": ["npm run typecheck"],
   "setupCommand": "npm ci",
-  "baseBranch": "main"
+  "baseBranch": "main",
+  "sessionCeilingHours": 8,
+  "maxConcurrentBatches": 2
 }

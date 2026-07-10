@@ -22,6 +22,12 @@ DO:
 - produce a written plan covering: files to create/modify, exported symbol
   names, ordering of changes, and any verification commands beyond the
   default typecheck
+- state 1-2 OUTPUT INVARIANTS the finished work must satisfy — falsifiable,
+  cheaply checkable claims about observable behaviour, not restatements of the
+  task (good: "generation-loss metric must be nonzero", "eligible-row count is
+  low thousands", "the new column is non-null on every migrated row"; bad:
+  "the feature works"). These are the tripwire that catches an implementer who
+  misreads the spec and confidently builds the wrong thing.
 
 === FRAMEWORK CITATION REQUIREMENT ===
 
@@ -60,7 +66,8 @@ downstream review round.
 === RETURN FORMAT ===
 
 Return EITHER:
-- A complete plan (markdown), ending with the CITATIONS block, OR
+- A complete plan (markdown), containing an `OUTPUT INVARIANTS` block (1-2
+  falsifiable checks) and ending with the CITATIONS block, OR
 - "BLOCKED — <reason>" if you cannot produce a plan
 
 === ISSUE #<N> ===
