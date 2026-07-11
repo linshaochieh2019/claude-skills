@@ -1,6 +1,6 @@
 ---
 argument-hint: "[optional issue numbers to restrict the conducted queue — omit to conduct the whole ready-for-agent queue]"
-description: One stateless conductor tick, designed to be driven by `/loop /conduct-issues` — keeps scoped /iterate-issues batches flowing unattended. Partitions the live queue at launch time, bounds work-in-flight, live-QAs UI batch PRs in Chrome, pings you when a PR is merge-ready, cleans up after you merge, then launches the next batch. Never merges, never applies migrations. Use when you want the issue pipeline to keep itself moving overnight while you stay the merge gate.
+description: One stateless conductor tick, designed to be driven by `/loop /conduct-issues` — keeps scoped /iterate-issues batches flowing unattended. Partitions the live queue at launch time, bounds work-in-flight, live-QAs UI batch PRs in Chrome, pings you when a PR is merge-ready, cleans up after merges, then launches the next batch. Never merges itself and never applies migrations; when the repo opts in via mergePolicy.autoMerge it dispatches /land-pr (autonomous) for safe-tier PRs, while migrations/auth/payments PRs always wait for you. Use when you want the issue pipeline to keep itself moving overnight while you stay the gate for what matters.
 ---
 
 # /conduct-issues — pipeline conductor (one tick per invocation)
@@ -16,7 +16,7 @@ This command invents **no new implementation path**. It only decides *when* to l
 
 ## Invariants
 
-- **Never merge, never close issues.** The human merge gate is the pipeline's last quality guarantee; removing it is not an optimization.
+- **The conductor itself never merges, never closes issues.** Default: every merge belongs to the human. When the repo opts in (`mergePolicy.autoMerge: true` in `.iterate-issues.json`), the conductor may *dispatch* `/land-pr` in autonomous mode for **safe-tier** PRs only — classification, green gate, and post-merge verification all live in that skill, in one place. Risk-tier PRs (migrations, auth/RLS, payments/e-invoicing, anything under `needsHumanPaths`) are ALWAYS pinged to the human; that residual gate is the pipeline's last quality guarantee and is not negotiable.
 - **Never launch a bare run.** Every batch this command starts is a *scoped* `/iterate-issues <numbers>` (scope suffix = collision safety).
 - **State lives in GitHub, re-read every tick.** A loop session gets summarized; labels, PRs, checks, and marker comments are the only trustworthy memory. Never act on what a previous tick "remembered".
 - **WIP cap.** In-flight = (batches still implementing) + (open unmerged `agent/batch-*` PRs) ≤ `maxConcurrentBatches` (config, default 2). The cap bounds review-bot quota (false-clean under concurrent load, observed 2026-06-25) *and* your merge burden — don't pile inventory in front of the constraint.
@@ -92,6 +92,16 @@ A PR whose diff has no UI files skips straight to D.
 
 An open batch PR with `Code Review` succeeded, QA clean or not applicable, and no `<!-- conductor-merge-ping <headRefOid> -->` comment yet → leave that marker comment, then send a PushNotification (load via ToolSearch): PR number, issues included, QA verdict, and the current `needs-triage` count (so you can top up the queue while merging). **Then wait — merging is yours.**
 
+### D2 — Auto-land a safe-tier PR (config-gated)
+
+Only when `mergePolicy.autoMerge` is `true` in the repo config. For a PR that has reached the D state (review succeeded, QA clean/N-A) **and** classifies **safe tier** under `/land-pr`'s risk gate (no file under `needsHumanPaths`, no migrations) **and** has no `<!-- conductor-autoland <headRefOid> -->` comment for the current head SHA:
+
+1. Leave the `<!-- conductor-autoland <headRefOid> -->` marker comment (dispatch-dedup, same pattern as C/D).
+2. Dispatch a background subagent running `/land-pr <n>` in **autonomous mode** (its prompt must say no human is available). The skill re-runs its own classification and green gate — the conductor's pre-check is a dispatch filter, not the safety mechanism.
+3. Do not wait; end the tick. The merged PR shows up in the next tick's Step 0 read → Action B cleans its worktree → the WIP slot frees → Action E launches the next group. Merges flow the pipeline automatically.
+
+Risk-tier PRs, config absent, or `autoMerge: false` → Action D ping, exactly as before. A PR whose head SHA moved after its QA marker re-enters C first (per-SHA markers already guarantee this).
+
 ### E — Launch the next batch
 
 If in-flight WIP < `MAX_WIP` and the (scoped) queue has issues not `in-progress`/`needs-human`:
@@ -148,9 +158,23 @@ Optional, freeform strings the QA step follows verbatim:
 }
 ```
 
+## Config — `mergePolicy` block in `.iterate-issues.json`
+
+Optional. Absent → the conductor never dispatches a merge (pure Action D pings).
+
+```json
+"mergePolicy": {
+  "autoMerge":       false,
+  "needsHumanPaths": ["path prefixes that make a PR risk-tier (migrations, auth, payments, ...)"],
+  "postMergeVerify": "freeform instructions /land-pr step 4.5 follows verbatim after landing a PR that touched sensitive paths (read-only evidence queries)"
+}
+```
+
+The block is consumed by `/land-pr`'s risk gate; the conductor only reads `autoMerge` and the classification to decide between D (ping) and D2 (dispatch).
+
 ## What this command does NOT do
 
-- Does not merge, close issues, or apply migrations/DB writes — ever.
+- Does not merge anything itself, close issues, or apply migrations/DB writes — ever. Safe-tier merges happen only through `/land-pr`'s full gate (D2), only when the repo config opts in; risk-tier PRs always end at the human.
 - Does not re-implement anything `/iterate-issues` owns; it launches and observes scoped instances of it.
 - Does not triage. `needs-triage` issues are counted and surfaced, never picked up.
 - Does not exceed the WIP cap, and never launches a bare (unscoped) run.
