@@ -23,6 +23,8 @@ This command invents **no new implementation path**. It only decides *when* to l
 - **Partition at launch time, never earlier.** The next group is computed from the queue as it exists *at that tick* — issues opened mid-loop join the next partition automatically.
 - **DB writes stay deferred.** Same as the engine: migrations are written as files only; anything needing a live-DB/PII write goes `needs-human`.
 - **QA fix loop is bounded to ONE round.** One fix dispatch, one re-QA. Still broken → `needs-human` + notify. No tight loops.
+- **Dispatch hygiene: `git -C`, never `cd && git`.** Every subagent prompt this command sends (QA fix rounds, inspections, anything touching a worktree from outside it) must state: cross-directory git is `git -C <path> ...` only — `cd <dir> && git ...` trips the harness's cd-before-git hook heuristic and forces a permission prompt **even when each part is allowlisted**. A prompt-blocked subagent emits no idle signal and looks identical to a hang (observed 2026-07-10: one batch stalled 3.5h on a confirmation box).
+- **Unattended runs need a prompt-free session.** If the night is meant to be zero-touch, the loop session itself should run with `--permission-mode acceptEdits` (or a vetted allowlist); otherwise any stray un-allowlisted call silently parks a child until a human answers.
 
 ## Step 0 — Read live state (every tick)
 
@@ -58,9 +60,13 @@ Actions are independent; one tick may clean up a merged PR *and* launch a new ba
 
 `in-progress` issues exist, no live child task is working them, and their scope-suffixed worktree exists → the child crashed. Re-launch a background scoped `/iterate-issues` with **the same issue numbers** (batch identity is a pure function of the args; its own Step 1 reconciliation handles the rest), model `opus` pinned as in Action E. Worktree missing too → leave it; the engine's reconciliation will `needs-human` it on the next scoped run.
 
+**Permission-hang watchdog.** A child that is *alive* but has produced no new commits on its branch and no idle signal for ~30+ min is presumed stuck on a permission prompt (see Dispatch hygiene invariant), not thinking. Nudge it once via SendMessage; no reaction → TaskStop it and re-launch per this action. Never let a silent child sit for hours on the assumption it's working.
+
 ### B — Clean up after your merge
 
 For each *merged* batch PR whose worktree still exists locally: `git worktree remove <dir>`, `git worktree prune`, delete the sibling `*-plans/` dir. This frees the WIP slot. (Engine Step 8, automated.)
+
+**Stale-label reconciliation.** An *open* batch PR still carrying `batch-pr-open` whose `Code Review` check has already concluded, with no live child owning it → the `/await-review` that should have cleared the label died mid-flight (e.g. its batch was killed/restarted). Remove the label here; downstream actions key off check conclusions, never off this label, so this is cosmetic-but-mandatory hygiene.
 
 ### C — Live QA a reviewed batch PR
 
@@ -75,6 +81,7 @@ Procedure:
 1. Derive the changed screens/routes from the diff.
 2. Start the app **from the batch worktree** per the config's `liveQa` block (see below); if absent, consult the repo's CLAUDE.md / runbooks for the sanctioned local-QA path.
 3. Drive Chrome (load `claude-in-chrome` tools via one ToolSearch batch) through each changed screen at every breakpoint the config names. Be picky — pixel-perfection standards apply; flag anything that looks off even if unrelated.
+   **QA is read-only**: navigate, scroll, screenshot. Never type into inputs or toggle controls unless the config's `liveQa` block explicitly sanctions it — autosave UIs persist on `change`, so "just testing a field" writes real data (incident 2026-07-11: a header field PATCHed a live record during QA).
 4. Post one PR comment starting with `<!-- conductor-live-qa <headRefOid> -->`, verdict `QA: CLEAN` or `QA: DEFECTS`, with concrete findings (screen, breakpoint, what's wrong).
 5. Kill the dev server.
 6. On `DEFECTS`: **one** fix round — dispatch a subagent (sonnet) in the batch worktree, scope hard-limited to the QA findings' blast radius, never migrations/schema, commit + push (new head SHA → C re-triggers exactly once). Second `DEFECTS` on the same PR → label it `needs-human`, notify, stop touching it.
@@ -98,7 +105,7 @@ If in-flight WIP < `MAX_WIP` and the (scoped) queue has issues not `in-progress`
    - Predicted shared files → same group; watch known hotspots (design-system CSS, shared primitives, glossary/CONTEXT docs).
    - A serial chain goes into ONE group whole — never split a chain.
    - Balance groups by issue count, not by maximizing group count. Everything collapsing into one group is a fine answer.
-3. Order groups: any group containing a P0 first, then P1, then lowest issue number.
+3. Order groups: any group containing a P0 first, then P1, then **larger groups before smaller** (LPT — the biggest batch bounds the night's wall-clock, so it must claim a slot in the first wave; observed 2026-07-10: a 5-issue group launched in wave 2 ran alone for the final two hours), ties by lowest issue number.
 4. Launch as many groups as free WIP slots allow (usually one): background general-purpose subagent with **model `opus` pinned explicitly** — the child is an `/iterate-issues` orchestrator and that command's Models table specifies Opus; never let it silently inherit the loop session's model. Task = *run `/iterate-issues <group numbers>` in this repo, following `~/.claude/commands/iterate-issues.md` end-to-end* (its planner/implementer/handler tiers are pinned inside that command and unaffected). Do **not** wait for it — end the tick.
 5. Log the partition + reasons as text (the audit trail for the no-HITL decision).
 
@@ -106,7 +113,17 @@ Never launch two groups sharing an issue number; never launch anything already `
 
 ### F — Nothing left
 
-Queue empty, no batch running, no unmerged batch PR → post a final one-line summary (include `needs-triage` count) and **end the loop** (in `/loop` dynamic mode: `ScheduleWakeup {stop: true}`).
+Queue empty, no batch running, no unmerged batch PR → post the **run report**, then **end the loop** (in `/loop` dynamic mode: `ScheduleWakeup {stop: true}`).
+
+Also post the run report (without stopping) when the terminal state is *"all PRs open, only waiting on merges"* and every open batch PR already has its merge-ping — that is the state a human wakes up to, and the report is what makes the morning hand-off self-serve.
+
+The run report (one message, also sent as a PushNotification):
+
+- Per batch PR: number, issues covered, diff size, duration (first commit on the branch → PR opened — derive from `git log`), QA verdict.
+- Suggested merge order (smallest/safest first; call out any PR containing `supabase/migrations/` changes — those need human eyes on the migration diff before merge, since merge auto-applies to prod).
+- `needs-human` issues parked during the run, with one-line reasons.
+- Current `needs-triage` count.
+- Anomalies: children killed/restarted, permission hangs, QA fix rounds spent.
 
 ## Pacing (for `/loop` dynamic mode)
 
