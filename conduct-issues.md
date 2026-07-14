@@ -19,7 +19,11 @@ This command invents **no new implementation path**. It only decides *when* to l
 - **The conductor itself never merges, never closes issues.** Default: every merge belongs to the human. When the repo opts in (`mergePolicy.autoMerge: true` in `.iterate-issues.json`), the conductor may *dispatch* `/land-pr` in autonomous mode for **safe-tier** PRs only — classification, green gate, and post-merge verification all live in that skill, in one place. Risk-tier PRs (migrations, auth/RLS, payments/e-invoicing, anything under `needsHumanPaths`) are ALWAYS pinged to the human; that residual gate is the pipeline's last quality guarantee and is not negotiable.
 - **Never launch a bare run.** Every batch this command starts is a *scoped* `/iterate-issues <numbers>` (scope suffix = collision safety).
 - **State lives in GitHub, re-read every tick.** A loop session gets summarized; labels, PRs, checks, and marker comments are the only trustworthy memory. Never act on what a previous tick "remembered".
-- **WIP cap.** In-flight = (batches still implementing) + (open unmerged `agent/batch-*` PRs) ≤ `maxConcurrentBatches` (config, default 2). The cap bounds review-bot quota (false-clean under concurrent load, observed 2026-06-25) *and* your merge burden — don't pile inventory in front of the constraint.
+- **Two WIP ledgers — active and parked. A PR waiting on a human is NOT work in flight.**
+  - **Active** = (batches still implementing) + (open batch PRs still in the review/QA loop, i.e. head SHA can still move) ≤ `maxConcurrentBatches` (config, default 2). This is what actually burns agent compute and review-bot quota (false-clean under concurrent load, observed 2026-06-25) — keep it tight.
+  - **Parked** = open batch PRs that have stopped and are waiting on *you*: a `<!-- conductor-merge-ping <headRefOid> -->` for the current head SHA, or a `needs-human` label. They consume **zero** agent capacity. Bounded separately by `maxParkedPRs` (config, default 5) — a cap on *your* merge burden and on merge-conflict surface, not on throughput.
+  - **The moment a PR parks, it leaves the active ledger and the slot frees** — Action E may launch the next batch in the same tick. If its head SHA later moves (you commented, an agent pushed a fix), it re-enters the active ledger and the review/QA loop, exactly as the per-SHA markers already guarantee.
+  - Why this is an invariant and not a tuning knob: **overnight, human availability is zero by definition**, so a parked PR is guaranteed to hold its slot until morning. Counting parked against active means two merge-pings deadlock the entire pipeline for the whole night — observed 2026-07-13: #969 parked 00:18, #970 parked 00:59, and the conductor then sat idle for 8.5 hours with 13 `ready-for-agent` issues untouched.
 - **Partition at launch time, never earlier.** The next group is computed from the queue as it exists *at that tick* — issues opened mid-loop join the next partition automatically.
 - **DB writes stay deferred.** Same as the engine: migrations are written as files only; anything needing a live-DB/PII write goes `needs-human`.
 - **QA fix loop is bounded to ONE round.** One fix dispatch, one re-QA. Still broken → `needs-human` + notify. No tight loops.
@@ -33,6 +37,7 @@ REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
 REPO_ROOT=$(git rev-parse --show-toplevel)
 CONFIG="$REPO_ROOT/.iterate-issues.json"
 MAX_WIP=$(jq -r '.maxConcurrentBatches // 2' "$CONFIG" 2>/dev/null || echo 2)
+MAX_PARKED=$(jq -r '.maxParkedPRs // 5' "$CONFIG" 2>/dev/null || echo 5)
 
 # Optional restriction, same digit-extraction semantics as /iterate-issues.
 SCOPE=$(printf '%s\n' "$ARGUMENTS" | grep -oE '[0-9]+' | sort -n -u)
@@ -42,7 +47,8 @@ gh issue list --repo "$REPO" --state open --label ready-for-agent --json number,
 # 2. Issues mid-implementation (theirs or ours — both count as WIP).
 gh issue list --repo "$REPO" --state open --label in-progress --json number,title
 # 3. Batch PRs, open and recently merged.
-gh pr list --repo "$REPO" --state open   --search 'head:agent/batch' --json number,headRefName,headRefOid,url
+#    Pull labels + comments too: they are what classify an open PR as ACTIVE vs PARKED.
+gh pr list --repo "$REPO" --state open   --search 'head:agent/batch' --json number,headRefName,headRefOid,url,labels,comments
 gh pr list --repo "$REPO" --state merged --search 'head:agent/batch' --limit 10 --json number,headRefName
 # 4. Worktrees left behind by batches.
 git worktree list
@@ -51,6 +57,18 @@ gh issue list --repo "$REPO" --state open --label needs-triage --json number --j
 ```
 
 Also note which background child tasks from earlier ticks are still alive (the harness notifies on completion — but a notification's exit code lies; the PR/label state above is the ground truth for whether a batch actually succeeded).
+
+**Then classify every open batch PR into exactly one ledger** (this is the input to Action E's slot arithmetic):
+
+- **PARKED** — carries a `needs-human` label, **or** a `<!-- conductor-merge-ping <headRefOid> -->` comment whose SHA equals the PR's *current* `headRefOid`. It is waiting on the human and nothing else. Does **not** consume an active slot.
+- **ACTIVE** — everything else: still implementing, mid-bot-review, awaiting QA, in a QA fix round, or its head SHA has moved past its merge-ping (→ it re-enters the loop). Consumes an active slot.
+
+A merge-ping whose SHA is *stale* (head moved after the ping) does **not** park the PR — that PR is ACTIVE again.
+
+```
+ACTIVE_WIP = (live implementing batches) + (open batch PRs classified ACTIVE)
+PARKED     = (open batch PRs classified PARKED)
+```
 
 ## Step 1 — Act (process every action that applies, in this order)
 
@@ -64,7 +82,7 @@ Actions are independent; one tick may clean up a merged PR *and* launch a new ba
 
 ### B — Clean up after your merge
 
-For each *merged* batch PR whose worktree still exists locally: `git worktree remove <dir>`, `git worktree prune`, delete the sibling `*-plans/` dir. This frees the WIP slot. (Engine Step 8, automated.)
+For each *merged* batch PR whose worktree still exists locally: `git worktree remove <dir>`, `git worktree prune`, delete the sibling `*-plans/` dir. This clears it from both ledgers. (Engine Step 8, automated.) Note the *active* slot was already freed when the PR parked or landed — this action reclaims disk and the parked-ledger entry, it is not what unblocks Action E.
 
 **Stale-label reconciliation.** An *open* batch PR still carrying `batch-pr-open` whose `Code Review` check has already concluded, with no live child owning it → the `/await-review` that should have cleared the label died mid-flight (e.g. its batch was killed/restarted). Remove the label here; downstream actions key off check conclusions, never off this label, so this is cosmetic-but-mandatory hygiene.
 
@@ -92,19 +110,53 @@ A PR whose diff has no UI files skips straight to D.
 
 An open batch PR with `Code Review` succeeded, QA clean or not applicable, and no `<!-- conductor-merge-ping <headRefOid> -->` comment yet → leave that marker comment, then send a PushNotification (load via ToolSearch): PR number, issues included, QA verdict, and the current `needs-triage` count (so you can top up the queue while merging). **Then wait — merging is yours.**
 
+Leaving that marker moves the PR to the **PARKED** ledger *immediately* — its active slot is free from this tick onward, so Action E may launch the next batch in the very same tick. Waiting on the human must never mean waiting on the pipeline.
+
+**The trigger list for D is closed.** A PR parks here for exactly three reasons, and there is no fourth:
+
+1. **Risk tier** — touches `needsHumanPaths` / `supabase/migrations/`.
+2. **`Code Review` did not succeed.**
+3. **QA is not CLEAN** — `DEFECTS` (after its one fix round) or `DEFERRED`.
+
+Anything else that is green and safe-tier goes to D2 and lands. In particular, **the conductor has no discretionary hold.** If you find yourself reasoning "the code is fine and the risk is safe, but I'd like a human to weigh in on X" — X is a follow-up issue, not a parked PR. See D2.
+
 ### D2 — Auto-land a safe-tier PR (config-gated)
 
-Only when `mergePolicy.autoMerge` is `true` in the repo config. For a PR that has reached the D state (review succeeded, QA clean/N-A) **and** classifies **safe tier** under `/land-pr`'s risk gate (no file under `needsHumanPaths`, no migrations) **and** has no `<!-- conductor-autoland <headRefOid> -->` comment for the current head SHA:
+Only when `mergePolicy.autoMerge` is `true` in the repo config.
+
+**These conditions are jointly sufficient. Meet them and you land — there is no further judgement to exercise:**
+
+- `Code Review` **succeeded**, and
+- QA is **CLEAN** or not applicable, and
+- the PR classifies **safe tier** under `/land-pr`'s risk gate (no file under `needsHumanPaths`, no migrations), and
+- no `<!-- conductor-autoland <headRefOid> -->` comment exists for the current head SHA.
+
+Then:
 
 1. Leave the `<!-- conductor-autoland <headRefOid> -->` marker comment (dispatch-dedup, same pattern as C/D).
 2. Dispatch a background subagent running `/land-pr <n>` in **autonomous mode** (its prompt must say no human is available). The skill re-runs its own classification and green gate — the conductor's pre-check is a dispatch filter, not the safety mechanism.
-3. Do not wait; end the tick. The merged PR shows up in the next tick's Step 0 read → Action B cleans its worktree → the WIP slot frees → Action E launches the next group. Merges flow the pipeline automatically.
+3. Do not wait; end the tick. The merged PR shows up in the next tick's Step 0 read → Action B cleans its worktree → the slot frees → Action E launches the next group. Merges flow the pipeline automatically.
+
+#### An unmet acceptance criterion is NOT a reason to hold a green PR
+
+`autoMerge: true` is the human's standing instruction: *safe tier, green, QA'd → land it, don't wake me.* It is not conditional on the batch having satisfied every AC.
+
+So when a green safe-tier batch shipped a **knowingly unmet or unreachable AC** — the spec asked for something arithmetically impossible, or the implementer made a defensible trade between two ACs — **land it anyway** and:
+
+- **File a follow-up issue** (`needs-triage`) capturing the gap: which AC, why it was not met, what shipped instead, and the decision the human actually needs to make. Reference the original issue and the landed PR.
+- **Name that follow-up in the autoland notification**, so the question reaches the human without the pipeline holding still to ask it.
+
+The shipped *behaviour* was reviewed, QA'd in a real browser, and is risk-free by classification. **A spec that contradicts reality is a bug in the spec, not in the PR** — and it costs a whole night to ask about it at 00:18 (observed 2026-07-13: #969 was green, SAFE, QA CLEAN, and still parked until morning over #946's AC1 asking for four columns in a viewport that cannot fit four columns).
+
+If a gap is genuinely bad enough that the code should not ship, that is not a hold — that is **`QA: DEFECTS`**, and it goes through C's fix round. "Green, but I'm holding it" is the worst of both: it blocks throughput without blocking any defect.
 
 Risk-tier PRs, config absent, or `autoMerge: false` → Action D ping, exactly as before. A PR whose head SHA moved after its QA marker re-enters C first (per-SHA markers already guarantee this).
 
 ### E — Launch the next batch
 
-If in-flight WIP < `MAX_WIP` and the (scoped) queue has issues not `in-progress`/`needs-human`:
+If `ACTIVE_WIP < MAX_WIP` **and** `PARKED < MAX_PARKED` and the (scoped) queue has issues not `in-progress`/`needs-human`:
+
+Note the two gates are separate and mean different things. `ACTIVE_WIP` is throughput — parked PRs are excluded from it, so a night full of merge-pings still launches batches. `PARKED >= MAX_PARKED` is the **only** state where waiting-on-you legitimately stops the pipeline: your review backlog is genuinely full, and piling on more inventory in front of the constraint helps nobody. On hitting it, launch nothing, send one PushNotification naming the parked PRs, and end the tick — do not treat it as action F (there is still work queued; you are the bottleneck, not the queue).
 
 0. **Cross-batch dependency deferral.** Scan eligible issues for `Depends on #N` / `Blocked by #N` edges. If a dependency is an open issue that is *not* itself eligible this tick — typically labeled `done`, sitting in an unmerged batch PR — **hold the dependent issue for a later tick**: exclude it from this partition instead of letting the engine `needs-human` it. Once you merge that PR the dependency closes, the next batch bases on the updated main, and the held issue becomes eligible naturally. (This is how a chain longer than one session ceiling flows across PRs: PR₂ builds on PR₁ *through main*, gated by your merge.)
 
@@ -170,6 +222,15 @@ Optional. Absent → the conductor never dispatches a merge (pure Action D pings
 }
 ```
 
+## Config — WIP ledgers in `.iterate-issues.json`
+
+```json
+"maxConcurrentBatches": 2,   // ACTIVE ledger: batches implementing + PRs whose head SHA can still move
+"maxParkedPRs":         5    // PARKED ledger: PRs stopped and waiting on the human (merge-ping / needs-human)
+```
+
+Keep `maxConcurrentBatches` tight (it bounds agent compute and review-bot quota). `maxParkedPRs` can be generous — it only bounds your morning merge burden and the merge-conflict surface between unmerged branches. Setting them as one number is the deadlock described in the Invariants.
+
 The block is consumed by `/land-pr`'s risk gate; the conductor only reads `autoMerge` and the classification to decide between D (ping) and D2 (dispatch).
 
 ## What this command does NOT do
@@ -177,6 +238,8 @@ The block is consumed by `/land-pr`'s risk gate; the conductor only reads `autoM
 - Does not merge anything itself, close issues, or apply migrations/DB writes — ever. Safe-tier merges happen only through `/land-pr`'s full gate (D2), only when the repo config opts in; risk-tier PRs always end at the human.
 - Does not re-implement anything `/iterate-issues` owns; it launches and observes scoped instances of it.
 - Does not triage. `needs-triage` issues are counted and surfaced, never picked up.
-- Does not exceed the WIP cap, and never launches a bare (unscoped) run.
+- Does not exceed either WIP ledger's cap, and never launches a bare (unscoped) run.
+- Does not let a PR that is merely *waiting on you* consume an active slot — parked ≠ active.
+- Does not hold a green, safe-tier, QA-CLEAN PR on discretion. An unmet AC becomes a follow-up issue; the PR lands. The only holds are risk tier, red review, and non-CLEAN QA.
 - Does not loop on a defective PR: one fix round, then `needs-human`.
 - Does not tolerate a concurrent **bare** `/iterate-issues` (it would double-pick issues). Concurrent *manual scoped* runs are fine — their labels/PRs are counted as WIP automatically.
