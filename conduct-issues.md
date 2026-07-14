@@ -17,6 +17,7 @@ This command invents **no new implementation path**. It only decides *when* to l
 ## Invariants
 
 - **The conductor itself never merges, never closes issues.** Default: every merge belongs to the human. When the repo opts in (`mergePolicy.autoMerge: true` in `.iterate-issues.json`), the conductor may *dispatch* `/land-pr` in autonomous mode for **safe-tier** PRs only — classification, green gate, and post-merge verification all live in that skill, in one place. Risk-tier PRs (migrations, auth/RLS, payments/e-invoicing, anything under `needsHumanPaths`) are ALWAYS pinged to the human; that residual gate is the pipeline's last quality guarantee and is not negotiable.
+- **A UI diff with no live QA never reaches the merge gate at all.** If the batch's diff touches UI files (globs in the config's `liveQa.uiDiffGate`) and live QA came back `DEFERRED` or `SKIPPED`, the PR is **hard-blocked**: no merge-ping, never autoMerge, BLOCKER comment instead (Action C2). A purely visual ticket's only acceptance procedure is *looking at it* — degrading that to a checklist line in a friendly deferral comment is how #895 shipped a layout nobody had ever seen (PR #904, 2026-07-11). Non-UI diffs are unaffected.
 - **Never launch a bare run.** Every batch this command starts is a *scoped* `/iterate-issues <numbers>` (scope suffix = collision safety).
 - **State lives in GitHub, re-read every tick.** A loop session gets summarized; labels, PRs, checks, and marker comments are the only trustworthy memory. Never act on what a previous tick "remembered".
 - **Two WIP ledgers — active and parked. A PR waiting on a human is NOT work in flight.**
@@ -106,6 +107,28 @@ Procedure:
 
 A PR whose diff has no UI files skips straight to D.
 
+### C2 — Hard-block a UI diff with no live QA
+
+The gate rule lives in the config: `liveQa.uiDiffGate` in `.iterate-issues.json`. Read it and follow it verbatim; the text below is only how it plugs into the tick.
+
+Trigger: an open batch PR where **all three** hold —
+
+1. The diff touches UI files per `liveQa.uiDiffGate` (`git diff --name-only origin/<base>...HEAD` — three-dot — matching the globs that block names; in this repo `app/**/*.tsx` and `app/os/styles/**`). Let `N` = the number of matched files.
+2. The `<!-- conductor-live-qa <headRefOid> -->` comment for the **current** head SHA carries a verdict of `DEFERRED` or `SKIPPED` — including every case where QA never opened a browser at all (env fail-closed, stale dataset, module not enabled).
+3. No `<!-- conductor-ui-qa-blocker <headRefOid> -->` comment exists yet for the current head SHA.
+
+Then:
+
+1. Post one PR comment beginning `<!-- conductor-ui-qa-blocker <headRefOid> -->`, whose body is the BLOCKER template in `liveQa.uiDiffGate`, rendered with: `<N>` = the matched-file count, the verdict (`DEFERRED`/`SKIPPED`), the reason copied from the QA comment, and **every matched UI file listed, one per line**.
+2. Label the PR `needs-human`.
+3. **Skip D and D2 for this PR entirely.** No merge-ping. No `/land-pr` dispatch. Not this tick, not any later tick, for as long as this head SHA stands.
+
+The `needs-human` label parks the PR (Step 0's classification), so its **active slot frees immediately** and Action E may still launch the next batch in this very tick — blocking a bad merge must never mean stalling the pipeline.
+
+This is an **escalation of the existing deferral notice, not a new QA state**: the QA verdict is still `DEFERRED`. What changed is that on a UI diff it now *blocks the merge* instead of reading as a friendly reminder that gets skimmed past next to the risk-tier checklist.
+
+If a later push moves the head SHA, the per-SHA markers make C re-QA from scratch and this gate re-evaluate. A re-QA that comes back `CLEAN` clears the block: remove the `needs-human` label and let the PR proceed to D/D2 normally.
+
 ### D — Ping you when a PR is merge-ready
 
 An open batch PR with `Code Review` succeeded, QA clean or not applicable, and no `<!-- conductor-merge-ping <headRefOid> -->` comment yet → leave that marker comment, then send a PushNotification (load via ToolSearch): PR number, issues included, QA verdict, and the current `needs-triage` count (so you can top up the queue while merging). **Then wait — merging is yours.**
@@ -116,7 +139,7 @@ Leaving that marker moves the PR to the **PARKED** ledger *immediately* — its 
 
 1. **Risk tier** — touches `needsHumanPaths` / `supabase/migrations/`.
 2. **`Code Review` did not succeed.**
-3. **QA is not CLEAN** — `DEFECTS` (after its one fix round) or `DEFERRED`.
+3. **QA is not CLEAN** — `DEFECTS` (after its one fix round), or `DEFERRED`/`SKIPPED` **on a diff with no UI files**. A `DEFERRED`/`SKIPPED` QA on a diff that *does* touch UI files never reaches D at all: it is hard-blocked by **C2**, which posts a BLOCKER comment and `needs-human` instead of a merge-ping. Parking a UI-diff PR with a merge-ready ping is exactly the #904 failure.
 
 Anything else that is green and safe-tier goes to D2 and lands. In particular, **the conductor has no discretionary hold.** If you find yourself reasoning "the code is fine and the risk is safe, but I'd like a human to weigh in on X" — X is a follow-up issue, not a parked PR. See D2.
 
@@ -129,7 +152,8 @@ Only when `mergePolicy.autoMerge` is `true` in the repo config.
 - `Code Review` **succeeded**, and
 - QA is **CLEAN** or not applicable, and
 - the PR classifies **safe tier** under `/land-pr`'s risk gate (no file under `needsHumanPaths`, no migrations), and
-- no `<!-- conductor-autoland <headRefOid> -->` comment exists for the current head SHA.
+- no `<!-- conductor-autoland <headRefOid> -->` comment exists for the current head SHA, and
+- **C2 did not fire** — a diff touching UI files whose QA is `DEFERRED`/`SKIPPED` is **never** auto-landed, regardless of tier or check colour.
 
 Then:
 
@@ -206,7 +230,8 @@ Optional, freeform strings the QA step follows verbatim:
   "url":         "where the running app answers",
   "login":       "the sanctioned QA auth path",
   "breakpoints": "which widths to test and how to achieve them",
-  "standards":   "which doc is law for judging what you see"
+  "standards":   "which doc is law for judging what you see",
+  "uiDiffGate":  "which globs count as UI files, and the hard block Action C2 applies when a UI diff's QA is DEFERRED/SKIPPED (incl. the BLOCKER comment template)"
 }
 ```
 
@@ -241,5 +266,6 @@ The block is consumed by `/land-pr`'s risk gate; the conductor only reads `autoM
 - Does not exceed either WIP ledger's cap, and never launches a bare (unscoped) run.
 - Does not let a PR that is merely *waiting on you* consume an active slot — parked ≠ active.
 - Does not hold a green, safe-tier, QA-CLEAN PR on discretion. An unmet AC becomes a follow-up issue; the PR lands. The only holds are risk tier, red review, and non-CLEAN QA.
+- Does not ping merge-ready — or autoland — a PR whose diff touches UI files when live QA came back `DEFERRED`/`SKIPPED`. That PR gets a BLOCKER comment and `needs-human` (C2). Config: `liveQa.uiDiffGate`.
 - Does not loop on a defective PR: one fix round, then `needs-human`.
 - Does not tolerate a concurrent **bare** `/iterate-issues` (it would double-pick issues). Concurrent *manual scoped* runs are fine — their labels/PRs are counted as WIP automatically.
