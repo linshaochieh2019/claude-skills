@@ -23,7 +23,7 @@ open issues → /triage → ┌────────────────�
                                      you merge (always)
 ```
 
-- **`/conduct-issues`** — the conductor: one stateless tick per invocation, designed to be driven by `/loop /conduct-issues`. Partitions the queue at launch time, bounds work-in-flight (≤2), live-QAs UI batch PRs in Chrome, notifies for merge, cleans up after merge, launches the next batch. Never merges, never applies migrations. Subsumes the retired `/fan-out-issues` (2026-07-10).
+- **`/conduct-issues`** — the conductor: one stateless tick per invocation, designed to be driven by `/loop /conduct-issues`. Partitions the queue at launch time, bounds work-in-flight per repo (≤2) and across repos (global governor in `~/.claude/loops/governor.json`), live-QAs UI batch PRs in Chrome, notifies for merge, cleans up after merge (incl. orphan worktree/plans sweeps), journals every tick to `<repo>/loops/conduct-issues/` (gitignored soft state + append-only log), launches the next batch. `/conduct-issues evolve` reads the journal and proposes contract improvements (human-approved). Incident case file: `conduct-issues/history.md` — rules cite it as `[H#]`. Never merges, never applies migrations. Subsumes the retired `/fan-out-issues` (2026-07-10).
 - **`/iterate-issues`** — the engine: drains one scoped batch of stacked issues into a single branch and exactly one PR (planner → implementer → two-stage review per issue, per-issue push, bot-review loop). Invoke directly only for "exactly one batch, right now."
 - **`/await-review`** — babysits the bot code-review loop on any PR (poll `Code Review` check, dispatch Haiku handler per comment, ≤3 rounds). Used by `/iterate-issues` Step 6; also standalone.
 - **`/gitlab-iterate-issues`** — GitLab port of the engine (`glab`, MRs instead of PRs). Host-specific auth details stay machine-local, never in this file set.
@@ -31,6 +31,8 @@ open issues → /triage → ┌────────────────�
 ## Bundled artifacts
 
 ```
+conduct-issues/
+  history.md                            # incident case file — the [H#] evidence behind conductor rules
 iterate-issues/
   config/.iterate-issues.example.json   # per-repo overrides — copy to <repo>/.iterate-issues.json
   scripts/advance-issue.sh              # deterministic issue-label transitions
