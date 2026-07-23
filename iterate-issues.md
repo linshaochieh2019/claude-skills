@@ -119,6 +119,7 @@ The batch PR carries `batch-pr-open` while awaiting bot review, and closes the i
 | Orchestrator (this command) | Opus | Coordinates everything; needs strong judgment for failure routing. |
 | Planner subagent (`superpowers:writing-plans`) | Opus | Architecture, file paths, framework citations — judgment-heavy. |
 | Implementer subagent (`superpowers:subagent-driven-development`) | Sonnet | Mechanical execution against a fixed plan. |
+| Hardening subagent (Step 5.1) | Sonnet | Mechanical: add a lint/CI rule the orchestrator already scoped. |
 | Review-handler subagent (`superpowers:receiving-code-review`) | Haiku 4.5 | Tight scope: read review, apply or push back, push commit. |
 | Sub-subagents inside `superpowers` skills | skill default | Don't override. |
 | Merge phase | n/a | Human review. |
@@ -144,6 +145,7 @@ Per-project, the active code-review workflow lives in `.github/workflows/` and m
 |---|---|---|
 | Per-issue planner | 15 min | Label `needs-human` with planner output (or "no output"). **Skip implementer**, continue queue. |
 | Per-issue implementer | 45 min | Roll back the issue's partial work, label `needs-human`, **continue to next issue**. |
+| Hardening pass (Step 5.1) | 20 min total | Drop the hardening commits (reset to pre-hardening HEAD), note it in the summary, proceed to Step 5.2. Never blocks the batch PR. |
 | Bot review (after batch PR opens) | 30 min poll | Label batch PR `bot-review-timeout`. Don't dispatch handler. |
 | Session ceiling (**single-PR scope ceiling**) | `sessionCeilingHours` (default 8h), **checked at each issue boundary — Step 4.0** | Not an emergency stop — a normal close-out: proceed to Step 5 (open the batch PR with completed issues), run the bot-review loop, leave the rest of the queue labeled `ready-for-agent` for the next run. |
 
@@ -290,7 +292,22 @@ LABELED=$(gh issue list --repo "$REPO" --state open --label done --json number -
 
 For every number in `COMMITTED` but not in `LABELED` that is part of this run's queue: it was implemented but the label flip was missed — fix it now (`--remove-label in-progress --add-label done`). For every number in `LABELED` but not in `COMMITTED`: stale label from elsewhere; exclude it from this PR's `Closes` list (the PR body must only close issues whose commits are on this branch).
 
-### 5.1 Push and open the PR
+### 5.1 Hardening pass — make fixed classes permanent
+
+Don't just fix instances; convert **mechanically-detectable classes** of mistake into lint/CI rules so no future run (agent or human) can reintroduce them. Tokens spent re-fixing the same class every batch are the failure mode this step exists to kill.
+
+**Scan.** Walk the batch's commits (`git log origin/$BASE_BRANCH..HEAD --stat`) and ask, per fix: does the root cause belong to a class a machine can catch? A candidate must meet **both**:
+
+1. **Mechanical, not semantic.** Detectable by pattern — banned API/import (use `no-restricted-imports` / `no-restricted-syntax` or the stack's equivalent), naming/file-placement convention, a required pairing (e.g. new endpoint ⇒ authz check), a "never modify existing migrations" invariant. Judgment calls ("bad abstraction", "wrong layer") are NOT candidates — those stay in CLAUDE.md and review.
+2. **Recurring or obviously likely to recur.** Same class appeared ≥2× in this batch, matches a known project lesson, or is a trap any future agent would plausibly hit.
+
+**No candidates → skip silently and go to 5.2.** That's the common case; do not force a rule out of every batch.
+
+**Dispatch.** For candidates (cap: **2 rules per batch** — precision over recall, rule-spam erodes trust in the linter), dispatch ONE Sonnet subagent, cwd `$WORKTREE_DIR`, with: the class description, the offending pattern + corrected pattern from the batch's own commits, and these directives — prefer extending the repo's existing linter config over adding new tooling; a bare grep/AST script wired into CI is acceptable when no linter fits; the rule's error message must state the correct alternative (that message is what steers the next agent); the full verification suite AND the new rule must pass on the current branch tip; commit as `hardening: <what it prevents> (class from #<N>)`.
+
+**On return.** Rule committed and verification passes → done, note it for the PR body and summary. Budget exceeded, rule misfires on existing code, or subagent blocked → reset to pre-hardening HEAD, note "hardening skipped: <reason>" in the summary, proceed. This step is a bonus, never a gate.
+
+### 5.2 Push and open the PR
 
 ```bash
 cd "$WORKTREE_DIR"
@@ -317,13 +334,16 @@ originating issue number. Merging this PR will close all listed issues.
 EOF
 )")
 
+# If Step 5.1 landed hardening commits, append a "## Hardening" section to the PR
+# body (gh pr edit --body) listing each rule and the mistake class it prevents.
+
 PR_NUM=$(echo "$PR_URL" | grep -oP '\d+$')
 gh pr edit "$PR_NUM" --add-label batch-pr-open --repo "$REPO"
 ```
 
 If no issues completed (everything went `needs-human`), skip the PR and post the summary directly.
 
-### 5.2 UI-heavy batch → flag for live QA
+### 5.3 UI-heavy batch → flag for live QA
 
 Static review, jsdom, and the planner are all blind to pad/touch CSS-cascade bugs (a standing project lesson: they only surface in a live ~810px browser). An AFK run can't drive a browser, so it must not imply UI correctness it never checked. Detect whether the batch touched UI surfaces:
 
@@ -364,6 +384,8 @@ Batch PR: #<PR_NUM>  (status: <ready-for-merge | needs-human | bot-review-timeou
 | #15 | needs-human | 0 (rolled back: <reason>) |
 | #16 | done | 1 |
 ...
+
+Hardening: <M rule(s) added: <one line each> | none — no mechanically-detectable class this batch | skipped: <reason>>
 
 NOTE: <K> issues remain in needs-triage. Run /triage before next /iterate-issues invocation.
 

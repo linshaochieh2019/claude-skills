@@ -69,6 +69,7 @@ State machine per issue: `ready-for-agent` → `in-progress` → `done` (committ
 | Orchestrator (this command) | Opus | Coordinates everything; failure routing needs judgment. |
 | Planner subagent (`superpowers:writing-plans`) | Opus | Architecture/naming/citations — judgment-heavy. |
 | Implementer subagent (`superpowers:subagent-driven-development`) | Sonnet | Mechanical execution against a fixed plan. |
+| Hardening subagent (Step 5.0) | Sonnet | Mechanical: add a lint/CI rule the orchestrator already scoped. |
 | Sub-subagents inside `superpowers` skills | skill default | Don't override. |
 | Merge | n/a | Human review. |
 
@@ -78,6 +79,7 @@ State machine per issue: `ready-for-agent` → `in-progress` → `done` (committ
 |---|---|---|
 | Per-issue planner | 15 min | Label `needs-human` with planner output. Skip implementer, continue queue. |
 | Per-issue implementer | 45 min | Roll back the issue's partial work, label `needs-human`, continue to next issue. |
+| Hardening pass (Step 5.0) | 20 min total | Drop hardening commits, note in summary, proceed to the MR. Never blocks. |
 | Whole-session ceiling | 8 hours | Push batch branch to remote, open MR with whatever completed, post partial summary. |
 
 ## Step 1 — Reconciliation pass (resume safety)
@@ -151,6 +153,12 @@ Render `~/.claude/commands/iterate-issues/templates/implementer-prompt.txt`, sub
 
 After the queue is drained (or the 8-hour ceiling hit):
 
+### 5.0 Hardening pass — make fixed classes permanent
+
+Run the hardening pass exactly as specified in `/iterate-issues` Step 5.1 (that file is the single source of truth for the procedure): scan the batch's commits for fixes whose root cause is a **mechanically-detectable, recurring** mistake class, and convert up to 2 such classes into lint/CI rules (for this Laravel stack: PHPStan/Larastan rules, Pint config, or a small CI grep script) via ONE Sonnet subagent. Commit as `hardening: <what it prevents> (class from #<iid>)`. 20-min budget; on failure or misfire, reset the hardening commits and note it in the summary — never block the MR. No candidates → skip silently.
+
+### 5.1 Push and open the MR
+
 ```bash
 cd "$WORKTREE_DIR"
 git push -u origin "$BATCH_BRANCH"
@@ -191,6 +199,9 @@ Batch MR: !<mr_iid>
 | #2 | done | 1 |
 | #4 | needs-human | 0 (rolled back: <reason>) |
 ...
+
+Hardening: <M rule(s) added | none | skipped: <reason>>
+
 
 Next: review MR !<mr_iid> commit-by-commit, then `glab mr merge <mr_iid> -R <REPO> --yes`.
 ```
