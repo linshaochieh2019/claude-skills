@@ -39,8 +39,11 @@ iterate-issues/
   templates/planner-prompt.txt          # planner subagent task prompt
   templates/implementer-prompt.txt      # implementer subagent task prompt
 _shared/
+  fleet-conventions.md                  # how every repo runs dev/verification/ticketing/merging — new-repo onboarding checklist
   bot-review-loop.sh                    # poll/dedup state machine (used by /await-review)
   handler-prompt.txt                    # review-handler subagent task prompt
 ```
+
+**Fleet conventions live in [`_shared/fleet-conventions.md`](./_shared/fleet-conventions.md)** — labels/ticketing, the shared code-review CI config, the `.iterate-issues.json` contract surface (`mergePolicy`, `standingDecisions`, `liveQa`), the qa-login script pattern, migration pipeline rules, journal layout, and the human-gate policy. Onboard a new repo by walking that checklist; don't re-derive per project.
 
 Per-repo config (`.iterate-issues.json` at a repo's root) is where project-specific facts live — base branch, session ceiling, WIP cap, and the `liveQa` block (how to boot the app, auth, breakpoints, which doc is design law). Keep secrets and machine/host-specific details out of this repo; it is public.
