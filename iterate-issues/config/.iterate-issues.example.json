@@ -8,5 +8,21 @@
   "setupCommand": "npm ci",
   "baseBranch": "main",
   "sessionCeilingHours": 8,
-  "maxConcurrentBatches": 2
+  "maxConcurrentBatches": 2,
+  "_comment_standingDecisions": "Answers a human already gave, so the same question never triggers needs-human twice. Agents cite entries and act; agents may PROPOSE entries but only humans commit them. See 'Standing decisions' in iterate-issues.md.",
+  "standingDecisions": [
+    {
+      "id": "example-vercel-cron-pro",
+      "decision": "Cron schedules stay in vercel.json at their functional frequency; the plan is upgraded to support them. A deploy failure on cron frequency is not a decision point — proceed, note the plan dependency in the PR body.",
+      "decidedIn": "PR #184 (2026-08-01)",
+      "scope": "vercel.json crons frequency vs Hobby/Pro plan limits"
+    }
+  ],
+  "_comment_liveQa": "How an agent can run a real-browser QA pass on this repo without a human. loginScript is a repo-committed script that reads secrets from .env.local itself and authenticates the session — the QA agent runs it, never handles or types a secret. Embedded verbatim in the batch PR's QA section (Step 5.3).",
+  "liveQa": {
+    "startCommand": "npx next dev -p 3100",
+    "port": 3100,
+    "loginScript": "node scripts/qa-login.mjs --port 3100",
+    "breakpoints": [390, 810]
+  }
 }

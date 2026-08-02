@@ -1,5 +1,5 @@
 ---
-argument-hint: "[issue numbers to scope to, e.g. 507 506 505 — omit to drain all ready-for-agent]"
+argument-hint: "[issue numbers to scope to, e.g. 507 506 505 — omit to drain all ready-for-agent | 'evolve' to run a self-improvement pass]"
 description: Drain all open `ready-for-agent` GitHub issues into a single batch branch end-to-end, then open one batch PR. Built for stacked queues where each issue depends on the previous. Wakes you with one PR to review. Use whenever you want to drain a stacked-issue queue, run an AFK batch, or "just work through the ready-for-agent issues."
 ---
 
@@ -62,6 +62,8 @@ Rules for safe concurrency:
 - **Resume = re-invoke with the same args.** Batch identity is a pure function of the scoped issue numbers, so resuming a crashed scoped run means passing the same numbers again (Step 1).
 
 ## Step 0 — Detect repo context
+
+**Mode dispatch first:** if `$ARGUMENTS` contains the word `evolve`, jump to "Evolve mode" at the bottom of this file and do NOTHING else — the digit-extraction below would read `evolve` as an empty scope and start a bare drain-everything batch, which is the opposite of what was asked.
 
 ```bash
 REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
@@ -139,6 +141,15 @@ The planner and implementer are **different subagents** with different scopes. I
 
 Per-project, the active code-review workflow lives in `.github/workflows/` and must meet the contract above. To swap providers (e.g., Claude ↔ Codex), replace or toggle the workflow file's trigger and adjust GitHub repo secrets accordingly. No changes to this command should be needed.
 
+## Standing decisions — escalate each question once, not once per run
+
+A human gate is only worth its cost the **first** time a question is asked. Both escalation paths (the Step 2 undecided-rule guard, and any mid-run "two options, I'm not choosing" moment — deploy blocked on a plan limit, AC conflicts with an a11y floor, delete-vs-merge) must check the ledger before pinging a human:
+
+- **Ledger location:** `standingDecisions` array in `.iterate-issues.json` (schema in the example config). Each entry: `id`, `decision` (the answer, stated so an agent can act on it), `decidedIn` (PR/issue/ADR reference), `scope` (what questions it covers).
+- **Covered → act.** Cite the entry id in the commit message or PR body ("per standing decision `vercel-cron-pro`") and proceed. Do not re-ask, do not soften into "flagging for visibility".
+- **Not covered → escalate as before**, and record the escalation in the run journal (Step 6.5) with `standing-candidate: yes` — that is the signal for the human (or an evolve run) to mint a new ledger entry, so the same question never gates twice.
+- **Only decisions humans already made belong in the ledger.** The agent proposes entries (in the run summary or an evolve run); the human commits them. An agent-authored answer in the ledger is the undecided-rule guard's failure mode with extra steps.
+
 ## Budgets
 
 | Phase | Wall-clock | On exceed |
@@ -184,7 +195,7 @@ If the (scoped) `ready-for-agent` queue is empty, exit cleanly: "no ready-for-ag
 
 For each issue, scan the body for **either** `Depends on #N` **or** `Blocked by[:]?\s*#N` lines (both are dependency edges; `/triage` issue templates use the second form). Topo-sort if any are present, otherwise ascending by issue number. Treat closed issues as satisfied dependencies; treat any open dependency that isn't itself in the current `ready-for-agent` queue as a hard blocker — label the dependent issue `needs-human` and skip it.
 
-**Undecided-rule guard.** `/triage` should never let an issue reach `ready-for-agent` with a product decision still open, but it is Matt's upstream skill and can't enforce that from here — so re-check at pickup. If an issue body still carries an unresolved-decision marker (e.g. "decide … during triage", "OPEN DECISION", "TBD", "to be defined/decided", or an unchecked decision checkbox in a "decisions to resolve" list), do **not** plan it: label it `needs-human` with comment "unresolved decision reached ready-for-agent — re-triage before agent pickup" and skip. Letting the orchestrator or planner make the product call is luck, not process (retro #676 item 7).
+**Undecided-rule guard.** `/triage` should never let an issue reach `ready-for-agent` with a product decision still open, but it is Matt's upstream skill and can't enforce that from here — so re-check at pickup. If an issue body still carries an unresolved-decision marker (e.g. "decide … during triage", "OPEN DECISION", "TBD", "to be defined/decided", or an unchecked decision checkbox in a "decisions to resolve" list), **first consult the standing-decisions ledger** (see "Standing decisions" below) — a marker whose question a ledger entry answers is resolved, not open: cite the entry id in the plan/commit and proceed. Only if no entry covers it: do **not** plan it — label it `needs-human` with comment "unresolved decision reached ready-for-agent — re-triage before agent pickup" and skip. Letting the orchestrator or planner make the product call is luck, not process (retro #676 item 7).
 
 Build a TodoWrite list with one entry per issue.
 
@@ -356,6 +367,8 @@ UI_HITS=$(git diff --name-only "origin/$BASE_BRANCH"..HEAD \
 
 If `UI_HITS` > 0, add a prominent line to the Step 7 summary: **"⚠️ UI-touching batch (<UI_HITS> files) — run a live browser pass (e.g. `/verify` or Chrome at 810px on the changed screens) BEFORE merging; the bot loop did not exercise the rendered UI."** This is advisory (no label, no block) — the point is to never present a UI batch as merge-ready without saying the visual layer is unverified.
 
+**If the config has a `liveQa` block** (see example config: `startCommand`, `port`, `loginScript`, `breakpoints`), embed it verbatim in the PR body's QA section — that is what lets the conductor (or a human's agent) actually run the pass instead of parking the PR as unverifiable. The `loginScript` contract: a repo-committed script that reads its own secrets from `.env.local` and prints/exports a session (e.g. mints the auth cookie via the repo's dev-login endpoint), so the QA agent authenticates by *running a script*, never by handling or typing a secret. A repo whose UI batches keep exiting `ui-unverified` in the journal and has no `liveQa` block: that's a standing evolve finding — file the repo issue for the login script.
+
 ## Step 6 — Bot review loop (delegated to `/await-review`)
 
 Delegate to `/await-review $PR_NUM`. It owns the polling/dedup state machine, the Haiku handler dispatch loop, and the 3-round cap. Pass `INPROGRESS_LABEL=batch-pr-open` via env so it clears that label from the batch PR on terminal exit:
@@ -366,7 +379,25 @@ INPROGRESS_LABEL=batch-pr-open /await-review "$PR_NUM"
 
 `/await-review` handles termination labelling itself: `needs-human` on `NEEDS_HUMAN`, `bot-review-timeout` on 30-min poll timeout, no label on clean exit. See `~/.claude/commands/await-review.md` for the full termination matrix and the code-review workflow contract (both apply unchanged here).
 
-When `/await-review` returns, proceed to Step 7 and report its final status in the batch summary.
+When `/await-review` returns, proceed to Step 6.5 and then Step 7.
+
+## Step 6.5 — Run journal (append-only; this is the learning loop's data)
+
+Append ONE entry to `<repo-root>/loops/iterate-issues/log.md` (`mkdir -p` the dir; create the file with a `# iterate-issues run journal — append-only` header if absent). Never edit prior entries. A run that ends without a journal entry is a bug — including runs that end early (empty queue, setup failure, ceiling at issue 0): journal those too, that data is exactly what evolve needs.
+
+Entry schema (one block per run):
+
+```markdown
+## <YYYY-MM-DD> | <BATCH_BRANCH> | PR #<n or "none"> | scope=<args or "bare">
+- queue: <picked>/<done>/<needs-human>/<left-for-next-run>
+- budgets: planner-overruns=<n> implementer-overruns=<n> ceiling-hit=<no | yes@Nh>
+- review: rounds=<n> handler-introduced-defects=<n>
+- escalations: [<type: decision|blocked|budget|rogue>] <one line each> → standing-candidate=<yes|no|covered-by:<id>>
+- gates-at-exit: migrations-unapplied=<n> ui-unverified=<n files|0> deploy-blocked=<what|none> other=<...>
+- friction: <1–3 lines: where the orchestrator wanted the contract to say something it doesn't — missing rule, wrong budget, gate that fired on a question already answered. "none" is a valid entry, but write it only after actually asking the question.>
+```
+
+`handler-introduced-defects` counts defects the review handler itself created while fixing a finding (each one costs extra rounds and human review attention — a rising count across runs is an evolve trigger for the handler's model or prompt). `escalations` must list every needs-human label and every mid-run human ping this run produced, each tagged with whether a standing decision could have absorbed it.
 
 ## Step 7 — Final summary
 
@@ -389,6 +420,10 @@ Batch PR: #<PR_NUM>  (status: <ready-for-merge | needs-human | bot-review-timeou
 Hardening: <M rule(s) added: <one line each> | none — no mechanically-detectable class this batch | skipped: <reason>>
 
 NOTE: <K> issues remain in needs-triage. Run /triage before next /iterate-issues invocation.
+
+Journal: entry appended to loops/iterate-issues/log.md (<total> run entries, <n> since last evolve).
+<If ≥3 entries since the last `## evolve` line: "Consider running `/iterate-issues evolve` — enough run data has accumulated.">
+<If any escalation was tagged standing-candidate=yes: "Standing-decision candidates: <ids/one-liners> — answer once in .iterate-issues.json standingDecisions and this class of gate disappears.">
 
 Next step: review batch PR #<PR_NUM> commit-by-commit, then `gh pr merge <PR_NUM> --squash`.
 ```
@@ -422,6 +457,15 @@ For routine exit states see Step 6.4. This table covers genuine failures.
 | Session ceiling (`sessionCeilingHours`) hit at Step 4.0 | Normal close-out, not a failure: proceed to Step 5, open batch PR with whatever's done, post partial summary. Remaining `ready-for-agent` issues stay queued for next run. Branch is already on remote (per-issue push). |
 | Worktree exists but on wrong branch | Step 1 detects via `git -C "$WORKTREE_DIR" branch --show-current`. If branch != `$BATCH_BRANCH`, label all in-progress issues `needs-human` and stop. Manual cleanup. |
 | `gh repo view` fails (not a GitHub repo) | Abort with "this command requires a GitHub remote." |
+
+## Evolve mode — `/iterate-issues evolve`
+
+The journal (Step 6.5) is the data; this is the loop that closes it. Run when invoked explicitly, or when a run summary notes ≥3 entries since the last evolve. Mirrors `/conduct-issues evolve`: per-repo data, one global contract.
+
+1. **Read the data.** Current repo's `loops/iterate-issues/log.md`, plus any sibling repos' (`../*/loops/iterate-issues/log.md`) — one repo's scar tissue becomes every repo's rule. Also skim the batch PR bodies the entries reference when a `friction` line needs context.
+2. **Look for recurrence, not incidents.** A thing that happened once is an anecdote; the same escalation type, budget overrun, gate, or friction line appearing across ≥2 runs is a contract defect. Classify each finding: (a) missing/wrong rule in this file, (b) missing standing decision (per-repo config, not contract), (c) repo infra debt (e.g. no scripted QA login, no test DB) — file or update a repo issue, (d) upstream (belongs to `/triage`, `/await-review`, or `/conduct-issues` — note it, don't fix it here).
+3. **Produce:** (a) a **proposed diff** to `iterate-issues.md` — **presented to the human, never self-applied**; the contract lives in the claude-skills repo and changes go through them; (b) proposed `standingDecisions` entries for questions a human has since answered (cite where); (c) an `## evolve` line appended to each journal read, summarizing what was proposed.
+4. **Keep the contract small.** Every proposed rule must trace to ≥2 journal entries or one severe incident. An evolve run that proposes nothing is a valid outcome — say so and append the evolve line anyway, so the next nudge counts from here.
 
 ## What this command does NOT do
 
