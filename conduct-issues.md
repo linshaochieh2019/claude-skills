@@ -20,7 +20,7 @@ This command invents no new implementation path. It decides *when* to launch *wh
 
 1. **GitHub (hard state, ground truth).** Labels, PRs, checks, marker comments — re-read every tick. Never act on what a previous tick "remembered"; a loop session gets summarized and its recollections rot.
 2. **`<repo>/loops/conduct-issues/state.md` (soft memory, hints only).** Small (≤20 lines), mutable: tonight's context — "review bot quota exhausted until ~02:00", "worktree dev servers need 90 s to boot", last tick's digest. Hints may save a tick from re-discovering tonight's noise, but they are **never a basis for action** — when a hint contradicts GitHub, GitHub wins and the hint gets deleted.
-3. **`<repo>/loops/conduct-issues/log.md` (append-only journal).** One line per tick, never edited, never read for action decisions. It exists for the human's morning review and for evolve runs. Silent ticks are forbidden — every tick appends, even (especially) idle ones.
+3. **`<repo>/loops/conduct-issues/log.md` (append-only journal).** One line per tick, never edited, never read for action decisions. It exists for the human's morning review and for evolve runs. Silent ticks are forbidden — every tick appends, even (especially) idle ones. The **tick is its sole writer**: a dispatched batch worker never creates, initializes, truncates, replaces, or appends this shared file.
 
 ## Invariants
 
@@ -35,9 +35,11 @@ This command invents no new implementation path. It decides *when* to launch *wh
 - **Partition at launch time, never earlier.** The next group is computed from the queue as it exists at that tick.
 - **DB writes stay deferred.** Migrations are written as files only; anything needing a live-DB/PII write goes `needs-human`.
 - **QA fix loop is bounded to ONE round.** One fix dispatch, one re-QA. Still broken → `needs-human` + notify.
+- **UI work is capability-gated before dispatch.** A predicted UI-changing batch may launch only after the conductor proves it can perform the repository's configured, production-safe live QA. A later code-review success never repairs a missing preflight.
 - **Dispatch hygiene: `git -C`, never `cd && git`** [H2] — stated in every subagent prompt this command sends.
 - **Unattended runs need a prompt-free session** [H2]: `--permission-mode acceptEdits` or a vetted allowlist.
-- **Every tick appends one journal line before it ends.** No silent ticks.
+- **The tick is the only conductor-journal writer.** A dispatched batch worker never creates, initializes, truncates, replaces, or appends `log.md`; it returns its one-line journal result to the tick that launched it. For worker-local diagnostics, use only its scope-private, gitignored path `<repo>/loops/conduct-issues/batches/<scope>/diagnostics.md`; no worker may use a shared journal or another scope's directory.
+- **Every tick appends exactly one journal line before it ends.** No silent ticks. Append only (`>>` — a single shell redirect of one already-newline-terminated line), never a read-modify-write of the whole file; if that append fails, the tick reports itself failed and leaves all prior journal bytes unchanged.
 
 ## Step 0 — Bootstrap, read, short-circuit
 
@@ -53,6 +55,9 @@ lastTick: (none)
 ## Tonight's hints
 (none)
 ```
+
+The tick performs this bootstrap. A worker that finds the folder or
+`log.md` missing must fail its launch report; it must never recreate either.
 
 `log.md`:
 ```markdown
@@ -89,7 +94,7 @@ git worktree list
 gh issue list --repo "$REPO" --state open --label needs-triage --json number --jq 'length'
 ```
 
-Also note which background child tasks from earlier ticks are still alive (a completion notification's exit code lies; the PR/label state above is the ground truth for whether a batch succeeded).
+Also note which background child tasks from earlier ticks are still alive (a completion notification's exit code lies; the PR/label state above is the ground truth for whether a batch succeeded). A dispatch is only a **candidate launch** until the launch-readiness check in Action E succeeds; never count a returned task handle, a sent prompt, or an optimistic label as a live worker.
 
 ### 0.4 Orphan sweep [H8]
 
@@ -120,7 +125,15 @@ Actions are independent; one tick may clean up a merged PR *and* launch a new ba
 
 ### A — Resume an orphaned batch
 
-`in-progress` issues exist, no live child works them, and their scope-suffixed worktree exists → the child crashed. Re-launch a background scoped `/iterate-issues` with **the same issue numbers**, model `opus` pinned as in Action E. Worktree missing too → leave it; the engine's reconciliation will `needs-human` it.
+`in-progress` issues exist, no live child works them, and their scope-suffixed worktree exists → the child crashed. Re-launch a background scoped `/iterate-issues` with **the same issue numbers**, model `opus` pinned as in Action E. Treat that retry as a new candidate launch and run the same readiness check before counting it.
+
+If the worker has already exited or its scoped worktree is missing, it is **not**
+active work: do not retain it in `ACTIVE_WIP`, do not register it in the
+governor, and do not launch a second worker for that scope. Record the failed
+attempt in the scope-private diagnostics file, reconcile its scope from GitHub
+and `git worktree list`, then either retry the one unclaimed scope or leave a
+clear `needs-human` recovery note when ownership cannot be proved. Never infer
+that a dead worker owns an issue from a stale task notification or label alone.
 
 **Permission-hang watchdog** [H2]: a child that is *alive* but shows no new commits and no idle signal for ~30+ min is presumed stuck on a prompt, not thinking. Nudge once via SendMessage; no reaction → TaskStop + relaunch. Never let a silent child sit for hours.
 
@@ -206,10 +219,26 @@ Then:
 1. **Partition** the eligible queue: dispatch a subagent running the `parallel-safety-check` skill over the issues (number, title, body), prompted that it is **non-interactive** (conclude, never ask), must predict the files/modules each issue touches (read-only exploration as needed), and must return safe-to-parallelize groups + serial queue + per-edge reasons.
 2. **Converge conservatively** (bias, not approval, is the no-HITL safety mechanism): when in doubt, same group (a wrong merge costs wall-clock; a wrong split costs a human untangling conflicting PRs); dependency edges → same group, always; predicted shared files → same group (watch design-system CSS, shared primitives, glossary/CONTEXT docs); a serial chain goes into ONE group whole; balance by issue count, not group count — everything collapsing into one group is a fine answer.
 3. Order groups: any group with a P0 first, then P1, then **larger before smaller** (LPT [H3]), ties by lowest issue number.
-4. Launch as many groups as free slots allow (usually one): background general-purpose subagent, **model `opus` pinned explicitly** (never inherit the loop session's model), task = *run `/iterate-issues <group numbers>` in this repo, following `~/.claude/commands/iterate-issues.md` end-to-end*. Register the launch in the governor file. Do not wait — end the tick.
-5. Record the partition + reasons in the journal line (the audit trail for the no-HITL decision).
+4. **Preflight every predicted UI group before dispatch.** Use the partition's predicted files/modules; uncertainty counts as UI-changing. Before launching such a group, verify both:
+   - the live browser backend is available to this conductor and can be started; and
+   - the repository's `liveQa` configuration is present and usable now: its safe QA environment, local startup, login, breakpoints, and read-only constraints can be followed without falling back to production data or a protected preview.
 
-Never launch two groups sharing an issue number; never launch anything already `in-progress`.
+   Record `qa-preflight=<scope>:available` or the concrete failed capability in the returned journal line. This is a capability check, **not** a substitute for the post-change live QA in Action C.
+
+   If preflight fails, do not launch that UI group and do not describe it as QA-ready or mergeable. Choose and record one safe path before implementation can finish:
+   - dispatch only the remaining groups whose predicted work is non-UI; or
+   - defer the UI group with a `needs-human` note naming the missing capability and an explicit visual-review plan (changed routes plus every configured breakpoint and read-only login path).
+
+   Do not claim a human review plan was completed, and do not create an implementation worker merely to discover that QA is unavailable after it changes UI files.
+5. **Launch and verify one eligible scope at a time.** Dispatch a background general-purpose subagent, **model `opus` pinned explicitly** (never inherit the loop session's model), task = *run `/iterate-issues <group numbers>` in this repo, following `~/.claude/commands/iterate-issues.md` end-to-end*. This dispatch creates only a candidate launch — **do not** register it in the governor, journal it as launched, or count it as `ACTIVE_WIP` yet. Within a short bounded startup window, independently re-read hard state and accept the launch only when all of the following are true:
+   - the worker is still alive after it reports startup (not merely a returned task handle), and its identity/scope matches this candidate;
+   - `git worktree list` contains the expected scope-suffixed batch worktree; and
+   - every scoped issue has the expected `in-progress` state with the same scope's ownership marker; no other live worker claims any of those issue numbers.
+
+   Only after all three checks pass may the conductor register the worker in the governor, include it in `ACTIVE_WIP`, and return `launched=<scope>`. If any check fails — including an immediately exiting worker, a missing worktree, or absent/mismatched issue ownership — terminate a still-running candidate, record `launch-failed:<scope>:<reason>` in its scope-private diagnostics, and leave it out of every active ledger. Reconcile hard state before one retry: a retry is permitted only after confirming there is no live worker and no valid worktree/ownership for that exact scope. This makes the failed attempt visible and recoverable without duplicate workers or falsely claimed issues.
+6. Record the partition + reasons in the journal line (the audit trail for the no-HITL decision), including every UI-QA preflight result and whether a UI group was withheld or a non-UI group was dispatched instead.
+
+Never launch two groups sharing an issue number; never launch anything already `in-progress`; never record a launch before its readiness checks succeed.
 
 ### F — Nothing left
 
@@ -227,11 +256,15 @@ The run report (one message, also a PushNotification):
 
 ## Step 2 — Close the tick (mandatory, no exceptions)
 
-1. **Append one journal line to `log.md`** per the schema — which actions fired, what launched (groups + issue numbers + one-line partition reason), QA verdicts, parks, lands, anomalies. Idle ticks log `actions=idle`.
+1. **Append exactly one journal line to `log.md`** per the schema — which actions fired, what launched (groups + issue numbers + one-line partition reason), QA verdicts, parks, lands, anomalies. Idle ticks log `actions=idle`. A dispatched batch worker never writes this file; it returns its line to the tick, which folds it into the tick's own.
 2. **Update `state.md`**: `lastDigest`, `lastTick`, and tonight's hints — add a hint only if it will plausibly save the *next* tick real work; delete hints that GitHub has contradicted or that expired. Keep the whole file ≤20 lines.
 3. **Update the governor file** (own repo's entry: current ACTIVE_WIP + timestamp).
 
-A tick that skips Step 2 is a bug — the journal is what evolve runs and morning reviews stand on.
+The append is a single `>>` redirect of one newline-terminated line — never
+read the file, edit it, and write it back. If the append fails, leave the
+journal untouched, mark the tick failed visibly, and preserve the line in the
+scope-private diagnostics path for recovery. A tick that skips Step 2 is a bug
+— the journal is what evolve runs and morning reviews stand on.
 
 ## Global governor — `~/.claude/loops/governor.json` [H8]
 
@@ -317,7 +350,8 @@ Keep `maxConcurrentBatches` tight — it bounds agent compute, review-bot quota 
 - Does not let a PR merely *waiting on you* consume an active slot — parked ≠ active [H6].
 - Does not hold a green, safe-tier, QA-CLEAN PR on discretion [H7]. The only holds are risk tier, red review, and non-CLEAN QA.
 - Does not ping merge-ready — or autoland — a UI-diff PR whose live QA came back `DEFERRED`/`SKIPPED`; that PR gets a BLOCKER + `needs-human` (C2) [H5].
+- Does not dispatch a predicted UI batch before it has proved browser and safe-QA capability, or represent a preflight failure as an automatically QA-ready or mergeable batch.
 - Does not loop on a defective PR: one fix round, then `needs-human`.
 - Does not act on `state.md` hints as if they were facts — GitHub outranks soft memory, always.
-- Does not end a tick without appending its journal line.
+- Does not let a worker create, truncate, replace, or append the shared journal; the tick appends exactly one line or fails visibly with prior bytes unchanged.
 - Does not tolerate a concurrent **bare** `/iterate-issues` (double-picks issues). Concurrent *manual scoped* runs are fine — their labels/PRs count as WIP automatically.
