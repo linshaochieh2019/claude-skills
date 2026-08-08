@@ -20,7 +20,7 @@ This command invents no new implementation path. It decides *when* to launch *wh
 
 1. **GitHub (hard state, ground truth).** Labels, PRs, checks, marker comments — re-read every tick. Never act on what a previous tick "remembered"; a loop session gets summarized and its recollections rot.
 2. **`<repo>/loops/conduct-issues/state.md` (soft memory, hints only).** Small (≤20 lines), mutable: tonight's context — "review bot quota exhausted until ~02:00", "worktree dev servers need 90 s to boot", last tick's digest. Hints may save a tick from re-discovering tonight's noise, but they are **never a basis for action** — when a hint contradicts GitHub, GitHub wins and the hint gets deleted.
-3. **`<repo>/loops/conduct-issues/log.md` (append-only journal).** One line per tick, never edited, never read for action decisions. It exists for the human's morning review and for evolve runs. Silent ticks are forbidden — every tick appends, even (especially) idle ones.
+3. **`<repo>/loops/conduct-issues/log.md` (append-only journal).** One line per tick, never edited, never read for action decisions. It exists for the human's morning review and for evolve runs. Silent ticks are forbidden — every tick appends, even (especially) idle ones. The **supervisor is its sole writer**: a dispatched batch worker never creates, initializes, truncates, replaces, or appends this shared file.
 
 ## Invariants
 
@@ -37,7 +37,8 @@ This command invents no new implementation path. It decides *when* to launch *wh
 - **QA fix loop is bounded to ONE round.** One fix dispatch, one re-QA. Still broken → `needs-human` + notify.
 - **Dispatch hygiene: `git -C`, never `cd && git`** [H2] — stated in every subagent prompt this command sends.
 - **Unattended runs need a prompt-free session** [H2]: `--permission-mode acceptEdits` or a vetted allowlist.
-- **Every tick appends one journal line before it ends.** No silent ticks.
+- **The supervisor is the only conductor-journal writer.** A tick or batch worker returns its one-line journal result to the supervisor; it must not touch `log.md`. For worker-local diagnostics, use only its scope-private, gitignored path `<repo>/loops/conduct-issues/batches/<scope>/diagnostics.md`; no worker may use a shared journal or another scope's directory.
+- **Every tick has one supervisor-appended journal line before the supervisor records it complete.** No silent ticks. The supervisor must use the append-only helper (never a read-modify-write); if that append fails, it reports the tick as failed and leaves all prior journal bytes unchanged.
 
 ## Step 0 — Bootstrap, read, short-circuit
 
@@ -53,6 +54,9 @@ lastTick: (none)
 ## Tonight's hints
 (none)
 ```
+
+The supervisor performs this bootstrap. A worker that finds the folder or
+`log.md` missing must fail its launch report; it must never recreate either.
 
 `log.md`:
 ```markdown
@@ -100,7 +104,7 @@ Also note which background child tasks from earlier ticks are still alive (a com
 
 ### 0.5 Digest short-circuit (the cheap-tick optimization)
 
-Compute `DIGEST = sha1` over the concatenated raw JSON of reads 1–5 above. If `DIGEST == state.lastDigest` **and** no task-notification arrived since the last tick **and** the live-children set is unchanged: nothing in the world has moved — append an `actions=idle` journal line, update `lastDigest`/`lastTick` in `state.md`, and **end the tick immediately** (pacing per the table below). Do not re-reason about actions on an unchanged world.
+Compute `DIGEST = sha1` over the concatenated raw JSON of reads 1–5 above. If `DIGEST == state.lastDigest` **and** no task-notification arrived since the last tick **and** the live-children set is unchanged: nothing in the world has moved — return `actions=idle` to the supervisor, update `lastDigest`/`lastTick` in `state.md`, and **end the tick immediately** (pacing per the table below). The supervisor appends that one line (pacing per the table below). Do not re-reason about actions on an unchanged world.
 
 ### 0.6 Classify every open batch PR into exactly one ledger
 
@@ -227,11 +231,15 @@ The run report (one message, also a PushNotification):
 
 ## Step 2 — Close the tick (mandatory, no exceptions)
 
-1. **Append one journal line to `log.md`** per the schema — which actions fired, what launched (groups + issue numbers + one-line partition reason), QA verdicts, parks, lands, anomalies. Idle ticks log `actions=idle`.
+1. **Return exactly one journal line to the supervisor** — which actions fired, what launched (groups + issue numbers + one-line partition reason), QA verdicts, parks, lands, anomalies. Idle ticks return `actions=idle`. A tick worker does not write `log.md`.
 2. **Update `state.md`**: `lastDigest`, `lastTick`, and tonight's hints — add a hint only if it will plausibly save the *next* tick real work; delete hints that GitHub has contradicted or that expired. Keep the whole file ≤20 lines.
 3. **Update the governor file** (own repo's entry: current ACTIVE_WIP + timestamp).
 
-A tick that skips Step 2 is a bug — the journal is what evolve runs and morning reviews stand on.
+The supervisor appends the returned line with the dedicated append-only helper
+only after it receives the tick result. If the helper fails, it must leave the
+journal untouched, mark the tick failed visibly, and preserve the returned
+result in the scope-private diagnostics path for recovery. A tick that skips
+Step 2 is a bug — the journal is what evolve runs and morning reviews stand on.
 
 ## Global governor — `~/.claude/loops/governor.json` [H8]
 
@@ -319,5 +327,5 @@ Keep `maxConcurrentBatches` tight — it bounds agent compute, review-bot quota 
 - Does not ping merge-ready — or autoland — a UI-diff PR whose live QA came back `DEFERRED`/`SKIPPED`; that PR gets a BLOCKER + `needs-human` (C2) [H5].
 - Does not loop on a defective PR: one fix round, then `needs-human`.
 - Does not act on `state.md` hints as if they were facts — GitHub outranks soft memory, always.
-- Does not end a tick without appending its journal line.
+- Does not let a worker create, truncate, replace, or append the shared journal; the supervisor appends exactly one returned line or fails visibly with prior bytes unchanged.
 - Does not tolerate a concurrent **bare** `/iterate-issues` (double-picks issues). Concurrent *manual scoped* runs are fine — their labels/PRs count as WIP automatically.
