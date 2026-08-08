@@ -93,7 +93,7 @@ git worktree list
 gh issue list --repo "$REPO" --state open --label needs-triage --json number --jq 'length'
 ```
 
-Also note which background child tasks from earlier ticks are still alive (a completion notification's exit code lies; the PR/label state above is the ground truth for whether a batch succeeded).
+Also note which background child tasks from earlier ticks are still alive (a completion notification's exit code lies; the PR/label state above is the ground truth for whether a batch succeeded). A dispatch is only a **candidate launch** until the launch-readiness check in Action E succeeds; never count a returned task handle, a sent prompt, or an optimistic label as a live worker.
 
 ### 0.4 Orphan sweep [H8]
 
@@ -124,7 +124,15 @@ Actions are independent; one tick may clean up a merged PR *and* launch a new ba
 
 ### A — Resume an orphaned batch
 
-`in-progress` issues exist, no live child works them, and their scope-suffixed worktree exists → the child crashed. Re-launch a background scoped `/iterate-issues` with **the same issue numbers**, model `opus` pinned as in Action E. Worktree missing too → leave it; the engine's reconciliation will `needs-human` it.
+`in-progress` issues exist, no live child works them, and their scope-suffixed worktree exists → the child crashed. Re-launch a background scoped `/iterate-issues` with **the same issue numbers**, model `opus` pinned as in Action E. Treat that retry as a new candidate launch and run the same readiness check before counting it.
+
+If the worker has already exited or its scoped worktree is missing, it is **not**
+active work: do not retain it in `ACTIVE_WIP`, do not register it in the
+governor, and do not launch a second worker for that scope. Record the failed
+attempt in the scope-private diagnostics file, reconcile its scope from GitHub
+and `git worktree list`, then either retry the one unclaimed scope or leave a
+clear `needs-human` recovery note when ownership cannot be proved. Never infer
+that a dead worker owns an issue from a stale task notification or label alone.
 
 **Permission-hang watchdog** [H2]: a child that is *alive* but shows no new commits and no idle signal for ~30+ min is presumed stuck on a prompt, not thinking. Nudge once via SendMessage; no reaction → TaskStop + relaunch. Never let a silent child sit for hours.
 
@@ -210,10 +218,15 @@ Then:
 1. **Partition** the eligible queue: dispatch a subagent running the `parallel-safety-check` skill over the issues (number, title, body), prompted that it is **non-interactive** (conclude, never ask), must predict the files/modules each issue touches (read-only exploration as needed), and must return safe-to-parallelize groups + serial queue + per-edge reasons.
 2. **Converge conservatively** (bias, not approval, is the no-HITL safety mechanism): when in doubt, same group (a wrong merge costs wall-clock; a wrong split costs a human untangling conflicting PRs); dependency edges → same group, always; predicted shared files → same group (watch design-system CSS, shared primitives, glossary/CONTEXT docs); a serial chain goes into ONE group whole; balance by issue count, not group count — everything collapsing into one group is a fine answer.
 3. Order groups: any group with a P0 first, then P1, then **larger before smaller** (LPT [H3]), ties by lowest issue number.
-4. Launch as many groups as free slots allow (usually one): background general-purpose subagent, **model `opus` pinned explicitly** (never inherit the loop session's model), task = *run `/iterate-issues <group numbers>` in this repo, following `~/.claude/commands/iterate-issues.md` end-to-end*. Register the launch in the governor file. Do not wait — end the tick.
+4. **Launch and verify one scope at a time.** Dispatch a background general-purpose subagent, **model `opus` pinned explicitly** (never inherit the loop session's model), task = *run `/iterate-issues <group numbers>` in this repo, following `~/.claude/commands/iterate-issues.md` end-to-end*. This dispatch creates only a candidate launch — **do not** register it in the governor, journal it as launched, or count it as `ACTIVE_WIP` yet. Within a short bounded startup window, independently re-read hard state and accept the launch only when all of the following are true:
+   - the worker is still alive after it reports startup (not merely a returned task handle), and its identity/scope matches this candidate;
+   - `git worktree list` contains the expected scope-suffixed batch worktree; and
+   - every scoped issue has the expected `in-progress` state with the same scope's ownership marker; no other live worker claims any of those issue numbers.
+
+   Only after all three checks pass may the conductor register the worker in the governor, include it in `ACTIVE_WIP`, and return `launched=<scope>`. If any check fails — including an immediately exiting worker, a missing worktree, or absent/mismatched issue ownership — terminate a still-running candidate, record `launch-failed:<scope>:<reason>` in its scope-private diagnostics, and leave it out of every active ledger. Reconcile hard state before one retry: a retry is permitted only after confirming there is no live worker and no valid worktree/ownership for that exact scope. This makes the failed attempt visible and recoverable without duplicate workers or falsely claimed issues.
 5. Record the partition + reasons in the journal line (the audit trail for the no-HITL decision).
 
-Never launch two groups sharing an issue number; never launch anything already `in-progress`.
+Never launch two groups sharing an issue number; never launch anything already `in-progress`; never record a launch before its readiness checks succeed.
 
 ### F — Nothing left
 
