@@ -42,7 +42,50 @@ _shared/
   fleet-conventions.md                  # how every repo runs dev/verification/ticketing/merging — new-repo onboarding checklist
   bot-review-loop.sh                    # poll/dedup state machine (used by /await-review)
   handler-prompt.txt                    # review-handler subagent task prompt
+  memory-snapshot.sh                    # auto-commit hook for the auto-memory corpus (not part of the issue pipeline)
 ```
+
+## Auto-memory snapshots
+
+`_shared/memory-snapshot.sh` version-controls Claude's auto-memory corpus
+(`~/.claude/projects/<project>/memory/`). That corpus is written by whole-file
+overwrite with no conflict detection, so on a machine running several sessions at
+once the newest index line can be silently lost, and nothing else on disk holds a
+copy. The script commits every write into a **local** git repo — one per project
+memory dir, created on first use.
+
+It is a `PostToolUse` hook. Wire it in `~/.claude/settings.json` (that file stays
+machine-local; this block is the whole of the wiring):
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/commands/_shared/memory-snapshot.sh",
+            "async": true,
+            "timeout": 30,
+            "statusMessage": "Snapshotting memory"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The hook fires on every `Write`/`Edit`; the script exits immediately for paths
+outside a memory dir (~134 ms, hence `async`). Two things it deliberately does:
+
+- **Never adds a remote.** A memory corpus holds operational context and customer
+  names. Backup is local by design; do not "improve" this by pushing it.
+- **Forces `core.autocrlf=false` and `* -text`** in the repos it creates. With the
+  global setting left on, a restore hands back a line-ending-rewritten file rather
+  than the bytes the harness wrote.
 
 **Fleet conventions live in [`_shared/fleet-conventions.md`](./_shared/fleet-conventions.md)** — labels/ticketing, the shared code-review CI config, the `.iterate-issues.json` contract surface (`mergePolicy`, `standingDecisions`, `liveQa`), the qa-login script pattern, migration pipeline rules, journal layout, and the human-gate policy. Onboard a new repo by walking that checklist; don't re-derive per project.
 
