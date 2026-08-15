@@ -1,0 +1,4 @@
+# Shell scripts must check out with LF even on Windows. With the common global
+# core.autocrlf=true, a fresh `git clone ... ~/.claude/commands` would otherwise
+# hand bash CRLF-terminated scripts, which fail with $'\r': command not found.
+*.sh text eol=lf
